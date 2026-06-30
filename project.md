@@ -42,3 +42,4 @@
 * Use Rust + Typescript, Tauri and Svelte for frameworks.
 * Use SQLite for database.
 * You can assume FFmpeg executables `ffmpeg.exe` and `ffprobe.exe` are available in executable search PATH.
+* Additional task: add sub-progress for large files during registration (per-file progress while hashing/processing).

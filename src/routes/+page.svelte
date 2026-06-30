@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { tick } from "svelte";
+  import { onMount, tick } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-dialog";
 
   type RegisterResult = {
@@ -8,6 +9,7 @@
     inserted_files: number;
     updated_paths: number;
     skipped_files: number;
+    canceled: boolean;
   };
 
   type FileRecord = {
@@ -19,11 +21,88 @@
     created_at: string;
   };
 
+  type RegisterProgress = {
+    folder_path: string;
+    total_files: number;
+    scanned_files: number;
+    inserted_files: number;
+    updated_paths: number;
+    skipped_files: number;
+    current_file_path: string | null;
+    current_file_size_bytes: number;
+    current_file_processed_bytes: number;
+    canceled: boolean;
+    done: boolean;
+  };
+
   let folderPath = $state("");
   let statusMessage = $state("Initializing...");
   let loading = $state(false);
   let lastResult = $state<RegisterResult | null>(null);
   let recentFiles = $state<FileRecord[]>([]);
+  let progress = $state<RegisterProgress | null>(null);
+  let cancelRequested = $state(false);
+  let overallStartMs = $state<number | null>(null);
+  let overallEtaSeconds = $state<number | null>(null);
+  let currentFileEtaPath = $state<string | null>(null);
+  let currentFileEtaStartMs = $state<number | null>(null);
+  let currentFileEtaStartBytes = $state(0);
+  let currentFileEtaSeconds = $state<number | null>(null);
+
+  const progressPercent = $derived.by(() => {
+    if (!progress || progress.total_files === 0) {
+      return 0;
+    }
+    return Math.min(100, Math.floor((progress.scanned_files / progress.total_files) * 100));
+  });
+
+  const currentFileProgressPercent = $derived.by(() => {
+    if (!progress || progress.current_file_size_bytes <= 0) {
+      return 0;
+    }
+    return Math.min(
+      100,
+      Math.floor((progress.current_file_processed_bytes / progress.current_file_size_bytes) * 100)
+    );
+  });
+
+  function formatBytes(bytes: number): string {
+    if (!Number.isFinite(bytes) || bytes < 0) {
+      return "0 B";
+    }
+
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let value = bytes;
+    let idx = 0;
+    while (value >= 1024 && idx < units.length - 1) {
+      value /= 1024;
+      idx += 1;
+    }
+
+    const decimals = idx === 0 ? 0 : 1;
+    return `${value.toFixed(decimals)} ${units[idx]}`;
+  }
+
+  function formatEta(seconds: number | null): string {
+    if (seconds === null || !Number.isFinite(seconds) || seconds < 0) {
+      return "--";
+    }
+
+    const rounded = Math.max(0, Math.floor(seconds));
+    const mins = Math.floor(rounded / 60);
+    const secs = rounded % 60;
+
+    if (mins <= 0) {
+      return `${secs}s`;
+    }
+    if (mins < 60) {
+      return `${mins}m ${secs}s`;
+    }
+
+    const hours = Math.floor(mins / 60);
+    const remMins = mins % 60;
+    return `${hours}h ${remMins}m`;
+  }
 
   async function loadRecentFiles() {
     recentFiles = await invoke<FileRecord[]>("list_recent_files", { limit: 25 });
@@ -65,11 +144,19 @@
     loading = true;
     statusMessage = "Registering files...";
     lastResult = null;
+    progress = null;
+    cancelRequested = false;
+    overallStartMs = null;
+    overallEtaSeconds = null;
+    currentFileEtaPath = null;
+    currentFileEtaStartMs = null;
+    currentFileEtaStartBytes = 0;
+    currentFileEtaSeconds = null;
     await tick();
 
     try {
       lastResult = await invoke<RegisterResult>("register_folder", { folderPath });
-      statusMessage = "Registration finished.";
+      statusMessage = lastResult.canceled ? "Registration canceled." : "Registration finished.";
       await loadRecentFiles();
     } catch (error) {
       statusMessage = `Registration failed: ${String(error)}`;
@@ -77,6 +164,105 @@
       loading = false;
     }
   }
+
+  async function cancelRegistration() {
+    if (!loading || cancelRequested) {
+      return;
+    }
+
+    cancelRequested = true;
+    statusMessage = "Cancel requested...";
+
+    try {
+      const accepted = await invoke<boolean>("cancel_register");
+      if (!accepted) {
+        statusMessage = "No active registration to cancel.";
+      }
+    } catch (error) {
+      cancelRequested = false;
+      statusMessage = `Cancel failed: ${String(error)}`;
+    }
+  }
+
+  onMount(() => {
+    let unlisten: null | (() => void) = null;
+
+    void listen<RegisterProgress>("register-progress", (event) => {
+      const payload = event.payload;
+      if (payload.folder_path !== folderPath) {
+        return;
+      }
+
+      progress = payload;
+      if (!payload.done) {
+        const now = Date.now();
+
+        if (payload.scanned_files > 0 && payload.total_files > 0) {
+          if (overallStartMs === null) {
+            overallStartMs = now;
+          }
+
+          if (overallStartMs !== null) {
+            const elapsedSec = (now - overallStartMs) / 1000;
+            const processed = payload.scanned_files;
+            const remaining = Math.max(0, payload.total_files - processed);
+            if (elapsedSec > 0 && processed > 0 && remaining > 0) {
+              const rate = processed / elapsedSec;
+              overallEtaSeconds = rate > 0 ? remaining / rate : null;
+            } else if (remaining === 0) {
+              overallEtaSeconds = 0;
+            }
+          }
+        }
+
+        if (payload.current_file_path && payload.current_file_size_bytes > 0) {
+          if (currentFileEtaPath !== payload.current_file_path) {
+            currentFileEtaPath = payload.current_file_path;
+            currentFileEtaStartMs = now;
+            currentFileEtaStartBytes = payload.current_file_processed_bytes;
+            currentFileEtaSeconds = null;
+          } else if (currentFileEtaStartMs !== null) {
+            const elapsedSec = (now - currentFileEtaStartMs) / 1000;
+            const deltaBytes = Math.max(
+              0,
+              payload.current_file_processed_bytes - currentFileEtaStartBytes
+            );
+            const remainingBytes = Math.max(
+              0,
+              payload.current_file_size_bytes - payload.current_file_processed_bytes
+            );
+            if (elapsedSec > 0 && deltaBytes > 0 && remainingBytes > 0) {
+              const rate = deltaBytes / elapsedSec;
+              currentFileEtaSeconds = rate > 0 ? remainingBytes / rate : null;
+            } else if (remainingBytes === 0) {
+              currentFileEtaSeconds = 0;
+            }
+          }
+        }
+
+        if (payload.total_files > 0) {
+          statusMessage = `Registering files... ${payload.scanned_files}/${payload.total_files} (${progressPercent}%)`;
+        } else {
+          statusMessage = `Registering files... ${payload.scanned_files}`;
+        }
+      } else if (payload.canceled) {
+        statusMessage = `Registration canceled at ${payload.scanned_files}/${payload.total_files || "?"}.`;
+        overallEtaSeconds = null;
+        currentFileEtaSeconds = null;
+      } else {
+        overallEtaSeconds = 0;
+        currentFileEtaSeconds = 0;
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+
+    return () => {
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  });
 
   initialize();
 </script>
@@ -104,8 +290,35 @@
         <button type="submit" disabled={loading || !folderPath.trim()}>
           {loading ? "Registering..." : "Register"}
         </button>
+        <button type="button" class="danger" onclick={cancelRegistration} disabled={!loading || cancelRequested}>
+          {cancelRequested ? "Canceling..." : "Cancel"}
+        </button>
       </div>
     </form>
+
+    {#if loading && progress}
+      <div class="progress-wrap">
+        <div class="progress-label">
+          <span>{progress.scanned_files}/{progress.total_files || "?"} scanned</span>
+          <span>{progressPercent}% | ETA {formatEta(overallEtaSeconds)}</span>
+        </div>
+        <progress max="100" value={progressPercent}></progress>
+
+        {#if progress.current_file_path}
+          <div class="subprogress-wrap">
+            <div class="progress-label">
+              <span class="file-name" title={progress.current_file_path}>{progress.current_file_path.split(/[/\\]/).pop()}</span>
+              <span>{currentFileProgressPercent}% | ETA {formatEta(currentFileEtaSeconds)}</span>
+            </div>
+            <div class="progress-label minor">
+              <span>{formatBytes(progress.current_file_processed_bytes)} / {formatBytes(progress.current_file_size_bytes)}</span>
+              <span>Current file</span>
+            </div>
+            <progress max="100" value={currentFileProgressPercent} class="subprogress"></progress>
+          </div>
+        {/if}
+      </div>
+    {/if}
 
     {#if lastResult}
       <div class="result-grid">
@@ -239,6 +452,12 @@
     border-color: #cfd8e3;
   }
 
+  button.danger {
+    background: #9f1239;
+    border-color: #9f1239;
+    color: #fff;
+  }
+
   button:disabled {
     opacity: 0.6;
     cursor: not-allowed;
@@ -249,6 +468,54 @@
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
     gap: 0.5rem;
+  }
+
+  .progress-wrap {
+    margin-top: 0.8rem;
+    display: grid;
+    gap: 0.35rem;
+  }
+
+  .subprogress-wrap {
+    margin-top: 0.4rem;
+    padding: 0.45rem 0.55rem;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    background: #f8fafc;
+  }
+
+  .progress-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.85rem;
+    color: #334155;
+    gap: 0.75rem;
+  }
+
+  .progress-label.minor {
+    margin-top: 0.2rem;
+    color: #64748b;
+    font-size: 0.78rem;
+  }
+
+  .file-name {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  progress {
+    width: 100%;
+    height: 0.8rem;
+    border-radius: 10px;
+    overflow: hidden;
+    accent-color: #0c6b58;
+  }
+
+  .subprogress {
+    height: 0.65rem;
+    accent-color: #0f766e;
   }
 
   .result-grid p {
