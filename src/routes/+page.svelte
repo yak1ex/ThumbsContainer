@@ -21,6 +21,11 @@
     created_at: string;
   };
 
+  type FileClassification = {
+    tags: string[];
+    rating: number | null;
+  };
+
   type RegisterProgress = {
     folder_path: string;
     total_files: number;
@@ -44,7 +49,13 @@
   let searchResults = $state<FileRecord[]>([]);
   let searchPath = $state("");
   let searchFilename = $state("");
+  let searchTag = $state("");
+  let searchMinRating = $state("");
   let searchRan = $state(false);
+  let selectedFileId = $state<number | null>(null);
+  let classTagsInput = $state("");
+  let classRating = $state("");
+  let classBusy = $state(false);
   let progress = $state<RegisterProgress | null>(null);
   let cancelRequested = $state(false);
   let overallStartMs = $state<number | null>(null);
@@ -137,6 +148,8 @@
       searchResults = await invoke<FileRecord[]>("search_files", {
         pathQuery: searchPath,
         filenameQuery: searchFilename,
+        tagQuery: searchTag,
+        minRating: searchMinRating.trim() ? Number(searchMinRating) : null,
         limit: 250
       });
       statusMessage = `Search finished. ${searchResults.length} result(s).`;
@@ -150,9 +163,67 @@
   function clearSearch() {
     searchPath = "";
     searchFilename = "";
+    searchTag = "";
+    searchMinRating = "";
     searchResults = [];
     searchRan = false;
     statusMessage = "Search cleared.";
+  }
+
+  async function loadClassification(fileId: number) {
+    if (classBusy) {
+      return;
+    }
+
+    classBusy = true;
+    statusMessage = `Loading classification for file ${fileId}...`;
+
+    try {
+      selectedFileId = fileId;
+      const classification = await invoke<FileClassification>("get_file_classification", {
+        fileId
+      });
+      classTagsInput = classification.tags.join(", ");
+      classRating = classification.rating === null ? "" : String(classification.rating);
+      statusMessage = `Classification loaded for file ${fileId}.`;
+    } catch (error) {
+      statusMessage = `Failed to load classification: ${String(error)}`;
+    } finally {
+      classBusy = false;
+    }
+  }
+
+  async function saveClassification() {
+    if (selectedFileId === null || classBusy) {
+      return;
+    }
+
+    const tags = classTagsInput
+      .split(",")
+      .map((v) => v.trim())
+      .filter((v) => v.length > 0);
+
+    const rating = classRating.trim() === "" ? null : Number(classRating);
+    if (rating !== null && (!Number.isInteger(rating) || rating < 1 || rating > 5)) {
+      statusMessage = "Rating must be an integer from 1 to 5.";
+      return;
+    }
+
+    classBusy = true;
+    statusMessage = `Saving classification for file ${selectedFileId}...`;
+
+    try {
+      await invoke<string>("save_file_classification", {
+        fileId: selectedFileId,
+        tags,
+        rating
+      });
+      statusMessage = `Classification saved for file ${selectedFileId}.`;
+    } catch (error) {
+      statusMessage = `Failed to save classification: ${String(error)}`;
+    } finally {
+      classBusy = false;
+    }
   }
 
   async function chooseFolder() {
@@ -324,6 +395,16 @@
         bind:value={searchFilename}
         disabled={searching || loading}
       />
+      <input
+        placeholder="Tag exact match (example: favorite)"
+        bind:value={searchTag}
+        disabled={searching || loading}
+      />
+      <input
+        placeholder="Minimum rating (1-5)"
+        bind:value={searchMinRating}
+        disabled={searching || loading}
+      />
       <div class="actions">
         <button type="submit" disabled={searching || loading}>
           {searching ? "Searching..." : "Search"}
@@ -346,6 +427,7 @@
                 <th>Name</th>
                 <th>Size</th>
                 <th>Hash</th>
+                <th>Action</th>
               </tr>
             </thead>
             <tbody>
@@ -358,6 +440,11 @@
                   </td>
                   <td>{file.size}</td>
                   <td class="hash">{file.hash.slice(0, 16)}...</td>
+                  <td>
+                    <button type="button" class="secondary" onclick={() => loadClassification(file.id)} disabled={classBusy}>
+                      Classify
+                    </button>
+                  </td>
                 </tr>
               {/each}
             </tbody>
@@ -365,6 +452,34 @@
         </div>
       {/if}
     {/if}
+  </section>
+
+  <section class="panel">
+    <h2>Classification</h2>
+    <form class="register-form" onsubmit={(e) => e.preventDefault()}>
+      <input value={selectedFileId === null ? "" : String(selectedFileId)} placeholder="File ID" disabled />
+      <input
+        placeholder="Tags (comma-separated: favorite, action, reference)"
+        bind:value={classTagsInput}
+        disabled={classBusy || selectedFileId === null}
+      />
+      <select bind:value={classRating} disabled={classBusy || selectedFileId === null}>
+        <option value="">No rating</option>
+        <option value="1">1</option>
+        <option value="2">2</option>
+        <option value="3">3</option>
+        <option value="4">4</option>
+        <option value="5">5</option>
+      </select>
+      <div class="actions">
+        <button type="button" onclick={saveClassification} disabled={classBusy || selectedFileId === null}>
+          {classBusy ? "Saving..." : "Save Classification"}
+        </button>
+      </div>
+    </form>
+    <p class="muted">
+      Select a file from Search or Recent Files using the Classify button, then edit tags/rating here.
+    </p>
   </section>
 
   <section class="panel">
@@ -436,6 +551,7 @@
               <th>Name</th>
               <th>Size</th>
               <th>Hash</th>
+              <th>Action</th>
             </tr>
           </thead>
           <tbody>
@@ -448,6 +564,11 @@
                 </td>
                 <td>{file.size}</td>
                 <td class="hash">{file.hash.slice(0, 16)}...</td>
+                <td>
+                  <button type="button" class="secondary" onclick={() => loadClassification(file.id)} disabled={classBusy}>
+                    Classify
+                  </button>
+                </td>
               </tr>
             {/each}
           </tbody>
@@ -519,6 +640,7 @@
   }
 
   input,
+  select,
   button {
     border-radius: 10px;
     border: 1px solid #d5dce8;
@@ -527,6 +649,11 @@
   }
 
   input {
+    width: 100%;
+    background: #fcfdff;
+  }
+
+  select {
     width: 100%;
     background: #fcfdff;
   }

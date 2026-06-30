@@ -30,6 +30,12 @@ struct FileRecord {
     created_at: String,
 }
 
+#[derive(Serialize)]
+struct FileClassification {
+    tags: Vec<String>,
+    rating: Option<i64>,
+}
+
 #[derive(Serialize, Clone)]
 struct RegisterProgress {
     folder_path: String,
@@ -66,6 +72,8 @@ fn open_db(app: &tauri::AppHandle) -> Result<Connection, String> {
 #[tauri::command]
 fn init_database(app: tauri::AppHandle) -> Result<String, String> {
     let conn = open_db(&app)?;
+    conn.execute("PRAGMA foreign_keys = ON", [])
+        .map_err(|e| format!("failed to enable foreign keys: {e}"))?;
 
     conn.execute_batch(
         "
@@ -80,6 +88,32 @@ fn init_database(app: tauri::AppHandle) -> Result<String, String> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_files_hash_size ON files(hash, size);
+
+                CREATE TABLE IF NOT EXISTS tags (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS file_tags (
+                    file_id INTEGER NOT NULL,
+                    tag_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (file_id, tag_id),
+                    FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+                    FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS file_ratings (
+                    file_id INTEGER PRIMARY KEY,
+                    rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_file_tags_file_id ON file_tags(file_id);
+                CREATE INDEX IF NOT EXISTS idx_file_tags_tag_id ON file_tags(tag_id);
+                CREATE INDEX IF NOT EXISTS idx_file_ratings_rating ON file_ratings(rating);
         ",
     )
     .map_err(|e| format!("failed to create schema: {e}"))?;
@@ -408,6 +442,8 @@ fn search_files(
     app: tauri::AppHandle,
     path_query: Option<String>,
     filename_query: Option<String>,
+    tag_query: Option<String>,
+    min_rating: Option<i64>,
     limit: Option<u32>,
 ) -> Result<Vec<FileRecord>, String> {
     let conn = open_db(&app)?;
@@ -421,22 +457,36 @@ fn search_files(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .map(|s| format!("%{s}%"));
+        let tag_value = tag_query
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
 
     let mut stmt = conn
         .prepare(
             "
-            SELECT id, path, filename, hash, size, created_at
-            FROM files
-            WHERE (?1 IS NULL OR path LIKE ?1)
-              AND (?2 IS NULL OR filename LIKE ?2)
-            ORDER BY updated_at DESC, id DESC
-            LIMIT ?3
+                        SELECT f.id, f.path, f.filename, f.hash, f.size, f.created_at
+                        FROM files f
+                        LEFT JOIN file_ratings fr ON fr.file_id = f.id
+                        WHERE (?1 IS NULL OR f.path LIKE ?1)
+                            AND (?2 IS NULL OR f.filename LIKE ?2)
+                            AND (
+                                ?3 IS NULL OR EXISTS (
+                                    SELECT 1
+                                    FROM file_tags ft
+                                    INNER JOIN tags t ON t.id = ft.tag_id
+                                    WHERE ft.file_id = f.id
+                                        AND t.name = ?3
+                                )
+                            )
+                            AND (?4 IS NULL OR fr.rating >= ?4)
+                        ORDER BY f.updated_at DESC, f.id DESC
+                        LIMIT ?5
             ",
         )
         .map_err(|e| format!("failed to prepare search query: {e}"))?;
 
     let rows = stmt
-        .query_map(params![path_pattern, filename_pattern, cap], |row| {
+                .query_map(params![path_pattern, filename_pattern, tag_value, min_rating, cap], |row| {
             Ok(FileRecord {
                 id: row.get(0)?,
                 path: row.get(1)?,
@@ -455,6 +505,123 @@ fn search_files(
     Ok(out)
 }
 
+#[tauri::command]
+fn get_file_classification(
+    app: tauri::AppHandle,
+    file_id: i64,
+) -> Result<FileClassification, String> {
+    let conn = open_db(&app)?;
+
+    let mut tags_stmt = conn
+        .prepare(
+            "
+            SELECT t.name
+            FROM file_tags ft
+            INNER JOIN tags t ON t.id = ft.tag_id
+            WHERE ft.file_id = ?
+            ORDER BY t.name ASC
+            ",
+        )
+        .map_err(|e| format!("failed to prepare tags query: {e}"))?;
+
+    let tags_rows = tags_stmt
+        .query_map([file_id], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("failed to query tags: {e}"))?;
+
+    let mut tags = Vec::new();
+    for row in tags_rows {
+        tags.push(row.map_err(|e| format!("failed to map tag row: {e}"))?);
+    }
+
+    let rating = conn
+        .query_row(
+            "SELECT rating FROM file_ratings WHERE file_id = ?",
+            [file_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok();
+
+    Ok(FileClassification { tags, rating })
+}
+
+#[tauri::command]
+fn save_file_classification(
+    app: tauri::AppHandle,
+    file_id: i64,
+    tags: Vec<String>,
+    rating: Option<i64>,
+) -> Result<String, String> {
+    if let Some(value) = rating {
+        if !(1..=5).contains(&value) {
+            return Err("rating must be in range 1..=5".to_string());
+        }
+    }
+
+    let mut conn = open_db(&app)?;
+    conn.execute("PRAGMA foreign_keys = ON", [])
+        .map_err(|e| format!("failed to enable foreign keys: {e}"))?;
+
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("failed to start transaction: {e}"))?;
+
+    tx.execute("DELETE FROM file_tags WHERE file_id = ?", [file_id])
+        .map_err(|e| format!("failed to clear existing tags: {e}"))?;
+
+    let mut normalized_tags = Vec::new();
+    for tag in tags {
+        let trimmed = tag.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !normalized_tags.iter().any(|existing: &String| existing == trimmed) {
+            normalized_tags.push(trimmed.to_string());
+        }
+    }
+
+    for tag in normalized_tags {
+        tx.execute("INSERT OR IGNORE INTO tags(name) VALUES (?)", [tag.as_str()])
+            .map_err(|e| format!("failed to insert tag '{tag}': {e}"))?;
+
+        let tag_id = tx
+            .query_row("SELECT id FROM tags WHERE name = ?", [tag.as_str()], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|e| format!("failed to resolve tag id for '{tag}': {e}"))?;
+
+        tx.execute(
+            "INSERT OR IGNORE INTO file_tags(file_id, tag_id) VALUES (?, ?)",
+            params![file_id, tag_id],
+        )
+        .map_err(|e| format!("failed to link tag '{tag}' to file: {e}"))?;
+    }
+
+    match rating {
+        Some(value) => {
+            tx.execute(
+                "
+                INSERT INTO file_ratings(file_id, rating, updated_at)
+                VALUES (?, ?, datetime('now'))
+                ON CONFLICT(file_id) DO UPDATE SET
+                  rating = excluded.rating,
+                  updated_at = datetime('now')
+                ",
+                params![file_id, value],
+            )
+            .map_err(|e| format!("failed to upsert rating: {e}"))?;
+        }
+        None => {
+            tx.execute("DELETE FROM file_ratings WHERE file_id = ?", [file_id])
+                .map_err(|e| format!("failed to clear rating: {e}"))?;
+        }
+    }
+
+    tx.commit()
+        .map_err(|e| format!("failed to commit classification update: {e}"))?;
+
+    Ok("classification saved".to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -466,7 +633,9 @@ pub fn run() {
             register_folder,
             cancel_register,
             list_recent_files,
-            search_files
+            search_files,
+            get_file_classification,
+            save_file_classification
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
