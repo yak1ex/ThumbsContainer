@@ -403,6 +403,58 @@ fn list_recent_files(app: tauri::AppHandle, limit: Option<u32>) -> Result<Vec<Fi
     Ok(out)
 }
 
+#[tauri::command]
+fn search_files(
+    app: tauri::AppHandle,
+    path_query: Option<String>,
+    filename_query: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<FileRecord>, String> {
+    let conn = open_db(&app)?;
+    let cap = limit.unwrap_or(100).min(500);
+
+    let path_pattern = path_query
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("%{s}%"));
+    let filename_pattern = filename_query
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("%{s}%"));
+
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT id, path, filename, hash, size, created_at
+            FROM files
+            WHERE (?1 IS NULL OR path LIKE ?1)
+              AND (?2 IS NULL OR filename LIKE ?2)
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?3
+            ",
+        )
+        .map_err(|e| format!("failed to prepare search query: {e}"))?;
+
+    let rows = stmt
+        .query_map(params![path_pattern, filename_pattern, cap], |row| {
+            Ok(FileRecord {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                filename: row.get(2)?,
+                hash: row.get(3)?,
+                size: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })
+        .map_err(|e| format!("failed to query search results: {e}"))?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("failed to map search row: {e}"))?);
+    }
+    Ok(out)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -413,7 +465,8 @@ pub fn run() {
             init_database,
             register_folder,
             cancel_register,
-            list_recent_files
+            list_recent_files,
+            search_files
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

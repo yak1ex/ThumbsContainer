@@ -38,8 +38,13 @@
   let folderPath = $state("");
   let statusMessage = $state("Initializing...");
   let loading = $state(false);
+  let searching = $state(false);
   let lastResult = $state<RegisterResult | null>(null);
   let recentFiles = $state<FileRecord[]>([]);
+  let searchResults = $state<FileRecord[]>([]);
+  let searchPath = $state("");
+  let searchFilename = $state("");
+  let searchRan = $state(false);
   let progress = $state<RegisterProgress | null>(null);
   let cancelRequested = $state(false);
   let overallStartMs = $state<number | null>(null);
@@ -116,6 +121,38 @@
     } catch (error) {
       statusMessage = `Initialization failed: ${String(error)}`;
     }
+  }
+
+  async function runSearch(event: Event) {
+    event.preventDefault();
+    if (searching) {
+      return;
+    }
+
+    searching = true;
+    searchRan = true;
+    statusMessage = "Searching...";
+
+    try {
+      searchResults = await invoke<FileRecord[]>("search_files", {
+        pathQuery: searchPath,
+        filenameQuery: searchFilename,
+        limit: 250
+      });
+      statusMessage = `Search finished. ${searchResults.length} result(s).`;
+    } catch (error) {
+      statusMessage = `Search failed: ${String(error)}`;
+    } finally {
+      searching = false;
+    }
+  }
+
+  function clearSearch() {
+    searchPath = "";
+    searchFilename = "";
+    searchResults = [];
+    searchRan = false;
+    statusMessage = "Search cleared.";
   }
 
   async function chooseFolder() {
@@ -272,6 +309,62 @@
     <h1>ThumbsContainer</h1>
     <p class="subtitle">First implementation slice: folder registration and metadata storage.</p>
     <p class="status">{statusMessage}</p>
+  </section>
+
+  <section class="panel">
+    <h2>Search</h2>
+    <form class="register-form" onsubmit={runSearch}>
+      <input
+        placeholder="Path contains (example: camera\\2026)"
+        bind:value={searchPath}
+        disabled={searching || loading}
+      />
+      <input
+        placeholder="Filename contains (example: .mp4 or IMG_)"
+        bind:value={searchFilename}
+        disabled={searching || loading}
+      />
+      <div class="actions">
+        <button type="submit" disabled={searching || loading}>
+          {searching ? "Searching..." : "Search"}
+        </button>
+        <button type="button" class="secondary" onclick={clearSearch} disabled={searching || loading}>
+          Clear
+        </button>
+      </div>
+    </form>
+
+    {#if searchRan}
+      {#if searchResults.length === 0}
+        <p class="muted">No matching files.</p>
+      {:else}
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Name</th>
+                <th>Size</th>
+                <th>Hash</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each searchResults as file}
+                <tr>
+                  <td>{file.id}</td>
+                  <td>
+                    <div class="name">{file.filename}</div>
+                    <div class="path">{file.path}</div>
+                  </td>
+                  <td>{file.size}</td>
+                  <td class="hash">{file.hash.slice(0, 16)}...</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
+    {/if}
   </section>
 
   <section class="panel">
