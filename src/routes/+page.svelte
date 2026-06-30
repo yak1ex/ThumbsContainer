@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { open } from "@tauri-apps/plugin-dialog";
 
@@ -39,14 +40,19 @@
   }
 
   async function chooseFolder() {
-    const selected = await open({
-      directory: true,
-      multiple: false,
-      title: "Select folder to register"
-    });
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "Select folder to register"
+      });
 
-    if (typeof selected === "string") {
-      folderPath = selected;
+      if (typeof selected === "string") {
+        folderPath = selected;
+        statusMessage = "Folder selected.";
+      }
+    } catch (error) {
+      statusMessage = `Browse failed: ${String(error)}`;
     }
   }
 
@@ -59,6 +65,7 @@
     loading = true;
     statusMessage = "Registering files...";
     lastResult = null;
+    await tick();
 
     try {
       lastResult = await invoke<RegisterResult>("register_folder", { folderPath });

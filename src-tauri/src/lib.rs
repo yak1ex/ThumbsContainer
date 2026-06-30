@@ -80,14 +80,16 @@ fn hash_file(path: &Path) -> Result<String, String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-#[tauri::command]
-fn register_folder(app: tauri::AppHandle, folder_path: String) -> Result<RegisterResult, String> {
-    let path = Path::new(&folder_path);
+fn register_folder_blocking(
+    app: &tauri::AppHandle,
+    folder_path: &str,
+) -> Result<RegisterResult, String> {
+    let path = Path::new(folder_path);
     if !path.exists() || !path.is_dir() {
         return Err("folder_path does not exist or is not a directory".to_string());
     }
 
-    let conn = open_db(&app)?;
+    let conn = open_db(app)?;
 
     let mut result = RegisterResult {
         scanned_files: 0,
@@ -165,6 +167,17 @@ fn register_folder(app: tauri::AppHandle, folder_path: String) -> Result<Registe
     }
 
     Ok(result)
+}
+
+#[tauri::command]
+async fn register_folder(
+    app: tauri::AppHandle,
+    folder_path: String,
+) -> Result<RegisterResult, String> {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || register_folder_blocking(&app_handle, &folder_path))
+        .await
+        .map_err(|e| format!("registration task failed to join: {e}"))?
 }
 
 #[tauri::command]
