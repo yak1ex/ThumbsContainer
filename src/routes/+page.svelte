@@ -9,6 +9,12 @@
     inserted_files: number;
     updated_paths: number;
     skipped_files: number;
+    created_containers: number;
+    updated_containers: number;
+    created_group_containers: number;
+    updated_group_containers: number;
+    created_thumbnails: number;
+    updated_thumbnails: number;
     canceled: boolean;
   };
 
@@ -19,11 +25,35 @@
     hash: string;
     size: number;
     created_at: string;
+    thumbnail_path: string | null;
+    thumbnail_data_url: string | null;
   };
 
   type FileClassification = {
     tags: string[];
     rating: number | null;
+  };
+
+  type ContainerRecord = {
+    id: number;
+    container_type: string;
+    display_name: string;
+    source_path: string;
+    updated_at: string;
+    child_count: number;
+  };
+
+  type ContainerChildRecord = {
+    id: number;
+    container_type: string;
+    display_name: string;
+    source_path: string;
+  };
+
+  type ContainerThumbnailRecord = {
+    slot_index: number;
+    thumbnail_path: string;
+    thumbnail_data_url: string | null;
   };
 
   type RegisterProgress = {
@@ -46,6 +76,12 @@
   let searching = $state(false);
   let lastResult = $state<RegisterResult | null>(null);
   let recentFiles = $state<FileRecord[]>([]);
+  let recentContainers = $state<ContainerRecord[]>([]);
+  let expandedContainers = $state<Record<number, boolean>>({});
+  let containerChildren = $state<Record<number, ContainerChildRecord[]>>({});
+  let loadingChildren = $state<Record<number, boolean>>({});
+  let containerThumbs = $state<Record<number, ContainerThumbnailRecord[]>>({});
+  let loadingThumbs = $state<Record<number, boolean>>({});
   let searchResults = $state<FileRecord[]>([]);
   let searchPath = $state("");
   let searchFilename = $state("");
@@ -120,8 +156,88 @@
     return `${hours}h ${remMins}m`;
   }
 
+  function displayThumbnailUrl(file: FileRecord): string | null {
+    if (file.thumbnail_data_url) {
+      return file.thumbnail_data_url;
+    }
+    if (file.thumbnail_path) {
+      return file.thumbnail_path;
+    }
+    return null;
+  }
+
+  function hasThumbnail(file: FileRecord): boolean {
+    return displayThumbnailUrl(file) !== null;
+  }
+
   async function loadRecentFiles() {
     recentFiles = await invoke<FileRecord[]>("list_recent_files", { limit: 25 });
+  }
+
+  async function loadContainerThumbnails(containerId: number) {
+    if (containerThumbs[containerId]) {
+      return;
+    }
+
+    loadingThumbs = { ...loadingThumbs, [containerId]: true };
+    try {
+      const thumbs = await invoke<ContainerThumbnailRecord[]>("list_container_thumbnails", {
+        containerId,
+        limit: 16
+      });
+      containerThumbs = { ...containerThumbs, [containerId]: thumbs };
+    } catch {
+      containerThumbs = { ...containerThumbs, [containerId]: [] };
+    } finally {
+      loadingThumbs = { ...loadingThumbs, [containerId]: false };
+    }
+  }
+
+  async function loadRecentContainers() {
+    recentContainers = await invoke<ContainerRecord[]>("list_recent_containers", { limit: 25 });
+
+    const ids = recentContainers.map((container) => container.id);
+    await Promise.all(ids.map((id) => loadContainerThumbnails(id)));
+  }
+
+  async function toggleContainerChildren(containerId: number) {
+    const isExpanded = !!expandedContainers[containerId];
+
+    if (isExpanded) {
+      expandedContainers = { ...expandedContainers, [containerId]: false };
+      return;
+    }
+
+    expandedContainers = { ...expandedContainers, [containerId]: true };
+
+    if (containerChildren[containerId]) {
+      return;
+    }
+
+    loadingChildren = { ...loadingChildren, [containerId]: true };
+    if (!containerThumbs[containerId]) {
+      loadingThumbs = { ...loadingThumbs, [containerId]: true };
+    }
+    try {
+      const children = await invoke<ContainerChildRecord[]>("list_container_children", {
+        containerId
+      });
+      const thumbs = containerThumbs[containerId]
+        ? containerThumbs[containerId]
+        : await invoke<ContainerThumbnailRecord[]>("list_container_thumbnails", {
+            containerId,
+            limit: 16
+          });
+      containerChildren = { ...containerChildren, [containerId]: children };
+      containerThumbs = { ...containerThumbs, [containerId]: thumbs };
+    } catch (error) {
+      statusMessage = `Failed to load children for container ${containerId}: ${String(error)}`;
+      containerChildren = { ...containerChildren, [containerId]: [] };
+      containerThumbs = { ...containerThumbs, [containerId]: [] };
+    } finally {
+      loadingChildren = { ...loadingChildren, [containerId]: false };
+      loadingThumbs = { ...loadingThumbs, [containerId]: false };
+    }
   }
 
   async function initialize() {
@@ -129,6 +245,7 @@
       await invoke<string>("init_database");
       statusMessage = "Database is ready.";
       await loadRecentFiles();
+      await loadRecentContainers();
     } catch (error) {
       statusMessage = `Initialization failed: ${String(error)}`;
     }
@@ -266,6 +383,7 @@
       lastResult = await invoke<RegisterResult>("register_folder", { folderPath });
       statusMessage = lastResult.canceled ? "Registration canceled." : "Registration finished.";
       await loadRecentFiles();
+      await loadRecentContainers();
     } catch (error) {
       statusMessage = `Registration failed: ${String(error)}`;
     } finally {
@@ -435,8 +553,17 @@
                 <tr>
                   <td>{file.id}</td>
                   <td>
-                    <div class="name">{file.filename}</div>
-                    <div class="path">{file.path}</div>
+                    <div class="file-cell">
+                      {#if hasThumbnail(file)}
+                        <img class="thumb" src={displayThumbnailUrl(file) ?? undefined} alt="thumbnail" />
+                      {:else}
+                        <div class="thumb placeholder">No preview</div>
+                      {/if}
+                      <div>
+                        <div class="name">{file.filename}</div>
+                        <div class="path">{file.path}</div>
+                      </div>
+                    </div>
                   </td>
                   <td>{file.size}</td>
                   <td class="hash">{file.hash.slice(0, 16)}...</td>
@@ -534,6 +661,110 @@
         <p>Inserted: <strong>{lastResult.inserted_files}</strong></p>
         <p>Moved updates: <strong>{lastResult.updated_paths}</strong></p>
         <p>Skipped: <strong>{lastResult.skipped_files}</strong></p>
+        <p>Containers created: <strong>{lastResult.created_containers}</strong></p>
+        <p>Containers updated: <strong>{lastResult.updated_containers}</strong></p>
+        <p>Group containers created: <strong>{lastResult.created_group_containers}</strong></p>
+        <p>Group containers updated: <strong>{lastResult.updated_group_containers}</strong></p>
+        <p>Thumbnails created: <strong>{lastResult.created_thumbnails}</strong></p>
+        <p>Thumbnails updated: <strong>{lastResult.updated_thumbnails}</strong></p>
+      </div>
+    {/if}
+  </section>
+
+  <section class="panel">
+    <h2>Recent Containers</h2>
+    {#if recentContainers.length === 0}
+      <p class="muted">No containers yet.</p>
+    {:else}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Type</th>
+              <th>Name</th>
+              <th>Source Path</th>
+              <th>Preview</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each recentContainers as container}
+              <tr>
+                <td>{container.id}</td>
+                <td>{container.container_type}</td>
+                <td>{container.display_name}</td>
+                <td class="path">{container.source_path}</td>
+                <td class="container-preview-cell">
+                  {#if loadingThumbs[container.id]}
+                    <p class="muted">Loading...</p>
+                  {:else if (containerThumbs[container.id] || []).length > 0}
+                    <div class="container-thumb-grid compact">
+                      {#each containerThumbs[container.id] as thumb}
+                        <div class="container-thumb-cell" title={`slot ${thumb.slot_index}`}>
+                          {#if thumb.thumbnail_data_url}
+                            <img class="container-thumb" src={thumb.thumbnail_data_url} alt={`thumb ${thumb.slot_index}`} />
+                          {:else}
+                            <div class="container-thumb placeholder">No preview</div>
+                          {/if}
+                        </div>
+                      {/each}
+                    </div>
+                  {:else}
+                    <p class="muted">No preview</p>
+                  {/if}
+                </td>
+                <td>
+                  <button
+                    type="button"
+                    class="secondary"
+                    onclick={() => toggleContainerChildren(container.id)}
+                    disabled={container.child_count === 0}
+                  >
+                    {expandedContainers[container.id] ? "Hide" : "Show"} ({container.child_count})
+                  </button>
+                </td>
+              </tr>
+              {#if expandedContainers[container.id]}
+                <tr class="child-row">
+                  <td colspan="6">
+                    {#if loadingThumbs[container.id]}
+                      <p class="muted">Loading thumbnails...</p>
+                    {:else if (containerThumbs[container.id] || []).length > 0}
+                      <div class="container-thumb-grid">
+                        {#each containerThumbs[container.id] as thumb}
+                          <div class="container-thumb-cell" title={`slot ${thumb.slot_index}`}>
+                            {#if thumb.thumbnail_data_url}
+                              <img class="container-thumb" src={thumb.thumbnail_data_url} alt={`thumb ${thumb.slot_index}`} />
+                            {:else}
+                              <div class="container-thumb placeholder">No preview</div>
+                            {/if}
+                          </div>
+                        {/each}
+                      </div>
+                    {/if}
+
+                    {#if loadingChildren[container.id]}
+                      <p class="muted">Loading children...</p>
+                    {:else if (containerChildren[container.id] || []).length === 0}
+                      <p class="muted">No child containers.</p>
+                    {:else}
+                      <ul class="child-list">
+                        {#each containerChildren[container.id] as child}
+                          <li>
+                            <span class="child-type">{child.container_type}</span>
+                            <span class="child-name">{child.display_name}</span>
+                            <span class="child-path">{child.source_path}</span>
+                          </li>
+                        {/each}
+                      </ul>
+                    {/if}
+                  </td>
+                </tr>
+              {/if}
+            {/each}
+          </tbody>
+        </table>
       </div>
     {/if}
   </section>
@@ -559,8 +790,17 @@
               <tr>
                 <td>{file.id}</td>
                 <td>
-                  <div class="name">{file.filename}</div>
-                  <div class="path">{file.path}</div>
+                    <div class="file-cell">
+                      {#if hasThumbnail(file)}
+                        <img class="thumb" src={displayThumbnailUrl(file) ?? undefined} alt="thumbnail" />
+                      {:else}
+                        <div class="thumb placeholder">No preview</div>
+                      {/if}
+                      <div>
+                        <div class="name">{file.filename}</div>
+                        <div class="path">{file.path}</div>
+                      </div>
+                    </div>
                 </td>
                 <td>{file.size}</td>
                 <td class="hash">{file.hash.slice(0, 16)}...</td>
@@ -761,8 +1001,6 @@
   th,
   td {
     text-align: left;
-    padding: 0.55rem 0.65rem;
-    border-bottom: 1px solid #edf1f7;
     vertical-align: top;
   }
 
@@ -778,11 +1016,117 @@
     font-weight: 600;
   }
 
+  .file-cell {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .thumb {
+    width: 72px;
+    height: 48px;
+    object-fit: cover;
+    border-radius: 8px;
+    border: 1px solid #dbe3ef;
+    background: #f8fafc;
+    flex: 0 0 auto;
+  }
+
+  .thumb.placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.72rem;
+    color: #64748b;
+  }
+
   .path,
   .hash,
   .muted {
     color: #64748b;
     font-size: 0.85rem;
+  }
+
+  .child-row td {
+    background: #f8fafc;
+  }
+
+  .container-thumb-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(60px, 1fr));
+    gap: 0.4rem;
+    margin-bottom: 0.6rem;
+    max-width: 520px;
+  }
+
+  .container-thumb-grid.compact {
+    grid-template-columns: repeat(4, minmax(40px, 1fr));
+    gap: 0.25rem;
+    margin-bottom: 0;
+    max-width: 220px;
+  }
+
+  .container-preview-cell {
+    min-width: 230px;
+  }
+
+  .container-thumb-cell {
+    border: 1px solid #d8e0ea;
+    border-radius: 8px;
+    overflow: hidden;
+    background: #ffffff;
+  }
+
+  .container-thumb {
+    display: block;
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    object-fit: cover;
+  }
+
+  .container-thumb.placeholder {
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #64748b;
+    font-size: 0.7rem;
+    background: #f1f5f9;
+  }
+
+  .child-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 0.4rem;
+  }
+
+  .child-list li {
+    display: grid;
+    gap: 0.15rem;
+    padding: 0.5rem 0.6rem;
+    border-radius: 8px;
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+  }
+
+  .child-type {
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: #0f766e;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .child-name {
+    font-weight: 600;
+  }
+
+  .child-path {
+    color: #64748b;
+    font-size: 0.8rem;
   }
 
   @media (max-width: 640px) {
