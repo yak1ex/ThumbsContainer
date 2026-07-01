@@ -54,7 +54,7 @@ This section summarizes the current development state and the mainline implement
   * Rust + Tauri v2 backend, SvelteKit + TypeScript frontend.
   * SQLite initialization and local app data storage.
   * Basic UI wiring to backend commands.
-* Current state: completed and stable.
+* Status: completed.
 
 ### 2. Registration pipeline and persistence
 
@@ -63,7 +63,7 @@ This section summarizes the current development state and the mainline implement
   * Folder scan and file registration to DB.
   * Metadata capture: hash, path, filename, size, timestamps.
   * Move detection by hash to update path while preserving existing metadata.
-* Current state: completed.
+* Status: completed.
 * Notes:
   * Registration runs in blocking worker context to keep UI responsive.
 
@@ -73,7 +73,7 @@ This section summarizes the current development state and the mainline implement
 * Implemented:
   * Search by path, filename, tags, and minimum rating.
   * Classification editing (tags and rating).
-* Current state: completed.
+* Status: completed.
 
 ### 4. Container model and grouping
 
@@ -82,7 +82,7 @@ This section summarizes the current development state and the mainline implement
   * Container records and parent/child relationships.
   * Group container creation and maintenance logic.
   * Recent containers and expandable child listing in UI.
-* Current state: completed.
+* Status: completed.
 
 ### 5. Registration progress, sub-progress, cancel, ETA
 
@@ -91,7 +91,7 @@ This section summarizes the current development state and the mainline implement
   * Overall progress events.
   * Per-file sub-progress for large files.
   * Cancel support and ETA display.
-* Current state: completed.
+* Status: completed.
 
 ### 6. Thumbnail generation for image/video
 
@@ -100,7 +100,7 @@ This section summarizes the current development state and the mainline implement
   * Image thumbnails.
   * Video multi-slot thumbnails (up to 16 slots).
   * Data URL delivery from backend to avoid frontend file loading issues.
-* Current state: completed.
+* Status: completed.
 
 ### 7. Archive thumbnail support and grid display
 
@@ -110,16 +110,79 @@ This section summarizes the current development state and the mainline implement
   * Archive thumbnail slot generation (up to 16) from extracted images.
   * Container preview grid rendering in UI (compact row preview + expanded view).
   * Additional archive extensions recognized: cbz, cbr, cb7.
-* Current state: implemented and compilable.
+* Status: in progress.
 * Remaining verification:
   * Re-register existing archive entries to backfill multi-slot thumbnails.
 
-### 8. Next mainline tasks
+### 8. Thumbnail backfill and maintenance
 
-* Goal: harden and operationalize thumbnail pipeline at scale.
+* Goal: make existing data consistent and keep preview caches healthy.
 * Planned:
   * Add targeted backfill command for archive thumbnails without full re-scan.
-  * Run thumbnail generation in a dedicated background queue.
-  * Add thumbnail cache maintenance commands (cleanup/orphan removal).
-  * Add tests for archive slot generation and container thumbnail query behavior.
-* Current state: pending.
+  * Add cache maintenance commands (cleanup/orphan removal).
+  * Add per-container refresh action in UI.
+* Status: pending.
+
+### 9. Background job system
+
+* Goal: isolate heavy tasks from interactive flows.
+* Planned:
+  * Introduce background queue for thumbnail generation and rebuild tasks.
+  * Separate registration completion from asynchronous thumbnail completion.
+  * Add job status and progress events for UI.
+* Status: pending.
+
+### 10. Dedupe workflow (user-driven)
+
+* Goal: support safe duplicate management without automatic deletion.
+* Planned:
+  * Duplicate candidate listing by hash and metadata.
+  * Side-by-side preview and metadata comparison.
+  * Explicit user confirmation flow before delete/move.
+  * Initial removal target is Recycle Bin or safe equivalent.
+* Status: pending.
+
+### 11. Combined container UX and search semantics
+
+* Goal: make combined containers first-class in search and browsing.
+* Planned:
+  * Create and edit combined containers from search and container views.
+  * Add search option to hide/show children belonging to combined containers.
+  * Improve child/parent navigation in UI.
+* Status: pending.
+
+### 12. Archive and nested container policy
+
+* Goal: define predictable handling for nested archives and mixed structures.
+* Planned:
+  * Add configurable archive traversal depth with safe default.
+  * Persist extraction/traversal decisions for reproducibility.
+  * Improve error reporting for corrupted archives and unsupported formats.
+* Status: pending.
+
+### 13. Classification schema evolution
+
+* Goal: let users evolve classification structure without schema rewrites.
+* Planned:
+  * User-defined rating dimensions (multiple perspectives).
+  * Tag management aids: suggestions, normalization, bulk operations.
+  * Migration-safe schema/versioning strategy for classification fields.
+* Status: pending.
+
+### 14. Performance and scale hardening
+
+* Goal: keep app responsive with large libraries.
+* Planned:
+  * Add DB index review and query tuning for common search patterns.
+  * Add incremental scan optimization and optional watch-based updates.
+  * Define performance baselines and profiling checkpoints.
+* Status: pending.
+
+### 15. Reliability, testing, and release flow
+
+* Goal: increase confidence and release quality.
+* Planned:
+  * Add backend tests for registration, dedupe candidate generation, and thumbnail paths.
+  * Add frontend smoke/regression tests for search, progress, and container previews.
+  * Add packaging/release checklist for Windows builds and upgrade safety.
+* Status: pending.
