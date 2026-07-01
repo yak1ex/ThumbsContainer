@@ -71,6 +71,15 @@ struct ContainerThumbnailRecord {
     thumbnail_data_url: Option<String>,
 }
 
+#[derive(Serialize)]
+struct ArchiveBackfillResult {
+    container_id: i64,
+    generated_slots: usize,
+    updated_slots: usize,
+    updated_file_thumbnail: bool,
+    skipped_reason: Option<String>,
+}
+
 struct ContainerUpsertOutcome {
     created: bool,
     container_id: i64,
@@ -1286,7 +1295,18 @@ fn list_recent_containers(
                             FROM container_children
                             GROUP BY parent_container_id
                         ) AS child_counts ON child_counts.parent_container_id = c.id
-                        ORDER BY c.updated_at DESC, c.id DESC
+                        LEFT JOIN (
+                            SELECT container_id, COUNT(*) AS slot_count
+                            FROM container_thumbnails
+                            GROUP BY container_id
+                        ) AS thumb_counts ON thumb_counts.container_id = c.id
+                        ORDER BY
+                            CASE
+                                WHEN c.container_type = 'archive' AND COALESCE(thumb_counts.slot_count, 0) < 16 THEN 0
+                                ELSE 1
+                            END ASC,
+                            c.updated_at DESC,
+                            c.id DESC
             LIMIT ?
             ",
         )
@@ -1389,6 +1409,99 @@ fn list_container_thumbnails(
     }
 
     Ok(out)
+}
+
+#[tauri::command]
+fn backfill_archive_container_thumbnails(
+    app: tauri::AppHandle,
+    container_id: i64,
+) -> Result<ArchiveBackfillResult, String> {
+    let conn = open_db(&app)?;
+
+    let row = conn
+        .query_row(
+            "
+            SELECT c.container_type, f.id, f.path, f.hash, f.size
+            FROM containers c
+            LEFT JOIN file_containers fc ON fc.container_id = c.id
+            LEFT JOIN files f ON f.id = fc.file_id
+            WHERE c.id = ?
+            ",
+            [container_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                ))
+            },
+        )
+        .map_err(|e| format!("failed to resolve archive container {container_id}: {e}"))?;
+
+    let (container_type, file_id_opt, file_path_opt, file_hash_opt, file_size_opt) = row;
+    if container_type != "archive" {
+        return Ok(ArchiveBackfillResult {
+            container_id,
+            generated_slots: 0,
+            updated_slots: 0,
+            updated_file_thumbnail: false,
+            skipped_reason: Some("container is not archive type".to_string()),
+        });
+    }
+
+    let (file_id, file_path, file_hash, file_size) = match (file_id_opt, file_path_opt, file_hash_opt, file_size_opt) {
+        (Some(id), Some(path), Some(hash), Some(size)) => (id, path, hash, size),
+        _ => {
+            return Ok(ArchiveBackfillResult {
+                container_id,
+                generated_slots: 0,
+                updated_slots: 0,
+                updated_file_thumbnail: false,
+                skipped_reason: Some("linked file metadata is missing".to_string()),
+            })
+        }
+    };
+
+    if !Path::new(&file_path).exists() {
+        return Ok(ArchiveBackfillResult {
+            container_id,
+            generated_slots: 0,
+            updated_slots: 0,
+            updated_file_thumbnail: false,
+            skipped_reason: Some("archive source file does not exist".to_string()),
+        });
+    }
+
+    let slots = generate_archive_thumbnail_set(&app, &file_path, &file_hash, file_size, 16)?;
+    let mut updated_slots = 0usize;
+    for (slot_index, thumb_path) in &slots {
+        if upsert_container_thumbnail(&conn, container_id, *slot_index, thumb_path)? {
+            updated_slots += 1;
+        }
+    }
+
+    let mut updated_file_thumbnail = false;
+    if let Some((_, first_thumb)) = slots.first() {
+        updated_file_thumbnail = upsert_thumbnail(&conn, file_id, first_thumb)?;
+    }
+
+    if updated_slots > 0 {
+        conn.execute(
+            "UPDATE containers SET updated_at = datetime('now') WHERE id = ?",
+            [container_id],
+        )
+        .map_err(|e| format!("failed to update archive container timestamp: {e}"))?;
+    }
+
+    Ok(ArchiveBackfillResult {
+        container_id,
+        generated_slots: slots.len(),
+        updated_slots,
+        updated_file_thumbnail,
+        skipped_reason: None,
+    })
 }
 
 #[tauri::command]
@@ -1554,6 +1667,69 @@ fn search_files(
 }
 
 #[tauri::command]
+fn search_containers(
+    app: tauri::AppHandle,
+    path_query: Option<String>,
+    name_query: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<ContainerRecord>, String> {
+    let conn = open_db(&app)?;
+    let cap = limit.unwrap_or(100).min(500);
+
+    let path_pattern = path_query
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("%{s}%"));
+    let name_pattern = name_query
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("%{s}%"));
+
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT
+                c.id,
+                c.container_type,
+                c.display_name,
+                c.source_path,
+                c.updated_at,
+                COALESCE(child_counts.child_count, 0) AS child_count
+            FROM containers AS c
+            LEFT JOIN (
+                SELECT parent_container_id, COUNT(*) AS child_count
+                FROM container_children
+                GROUP BY parent_container_id
+            ) AS child_counts ON child_counts.parent_container_id = c.id
+            WHERE (?1 IS NULL OR c.source_path LIKE ?1)
+              AND (?2 IS NULL OR c.display_name LIKE ?2)
+            ORDER BY c.updated_at DESC, c.id DESC
+            LIMIT ?3
+            ",
+        )
+        .map_err(|e| format!("failed to prepare container search query: {e}"))?;
+
+    let rows = stmt
+        .query_map(params![path_pattern, name_pattern, cap], |row| {
+            Ok(ContainerRecord {
+                id: row.get(0)?,
+                container_type: row.get(1)?,
+                display_name: row.get(2)?,
+                source_path: row.get(3)?,
+                updated_at: row.get(4)?,
+                child_count: row.get(5)?,
+            })
+        })
+        .map_err(|e| format!("failed to query container search results: {e}"))?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("failed to map container search row: {e}"))?);
+    }
+    Ok(out)
+}
+
+#[tauri::command]
 fn get_file_classification(
     app: tauri::AppHandle,
     file_id: i64,
@@ -1684,7 +1860,9 @@ pub fn run() {
             list_recent_containers,
             list_container_children,
             list_container_thumbnails,
+            backfill_archive_container_thumbnails,
             search_files,
+            search_containers,
             get_file_classification,
             save_file_classification
         ])

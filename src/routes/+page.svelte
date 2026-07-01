@@ -56,6 +56,14 @@
     thumbnail_data_url: string | null;
   };
 
+  type ArchiveBackfillResult = {
+    container_id: number;
+    generated_slots: number;
+    updated_slots: number;
+    updated_file_thumbnail: boolean;
+    skipped_reason: string | null;
+  };
+
   type RegisterProgress = {
     folder_path: string;
     total_files: number;
@@ -82,11 +90,15 @@
   let loadingChildren = $state<Record<number, boolean>>({});
   let containerThumbs = $state<Record<number, ContainerThumbnailRecord[]>>({});
   let loadingThumbs = $state<Record<number, boolean>>({});
+  let backfillingThumbs = $state<Record<number, boolean>>({});
   let searchResults = $state<FileRecord[]>([]);
+  let searchContainerResults = $state<ContainerRecord[]>([]);
+  let focusedContainerId = $state<number | null>(null);
   let searchPath = $state("");
   let searchFilename = $state("");
   let searchTag = $state("");
   let searchMinRating = $state("");
+  let searchIncludeContainers = $state(true);
   let searchRan = $state(false);
   let selectedFileId = $state<number | null>(null);
   let classTagsInput = $state("");
@@ -240,6 +252,59 @@
     }
   }
 
+  async function backfillArchiveContainer(container: ContainerRecord) {
+    if (container.container_type !== "archive" || backfillingThumbs[container.id]) {
+      return;
+    }
+
+    backfillingThumbs = { ...backfillingThumbs, [container.id]: true };
+    statusMessage = `Backfilling archive thumbnails for container ${container.id}...`;
+
+    try {
+      const result = await invoke<ArchiveBackfillResult>("backfill_archive_container_thumbnails", {
+        containerId: container.id
+      });
+
+      const refreshed = await invoke<ContainerThumbnailRecord[]>("list_container_thumbnails", {
+        containerId: container.id,
+        limit: 16
+      });
+      containerThumbs = { ...containerThumbs, [container.id]: refreshed };
+
+      if (result.skipped_reason) {
+        statusMessage = `Archive backfill skipped for container ${container.id}: ${result.skipped_reason}`;
+      } else {
+        statusMessage = `Archive backfill finished for container ${container.id}. Generated ${result.generated_slots} slot(s), updated ${result.updated_slots} slot(s).`;
+      }
+
+      await loadRecentFiles();
+    } catch (error) {
+      statusMessage = `Archive backfill failed for container ${container.id}: ${String(error)}`;
+    } finally {
+      backfillingThumbs = { ...backfillingThumbs, [container.id]: false };
+    }
+  }
+
+  async function openContainerInRecent(container: ContainerRecord) {
+    if (!recentContainers.some((v) => v.id === container.id)) {
+      recentContainers = [container, ...recentContainers];
+      await loadContainerThumbnails(container.id);
+    }
+
+    if (container.child_count > 0 && !expandedContainers[container.id]) {
+      await toggleContainerChildren(container.id);
+    } else if (container.child_count === 0) {
+      expandedContainers = { ...expandedContainers, [container.id]: false };
+    }
+
+    focusedContainerId = container.id;
+    statusMessage = `Opened container ${container.id} in Recent Containers.`;
+
+    await tick();
+    const row = document.getElementById(`recent-container-row-${container.id}`);
+    row?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
   async function initialize() {
     try {
       await invoke<string>("init_database");
@@ -269,7 +334,18 @@
         minRating: searchMinRating.trim() ? Number(searchMinRating) : null,
         limit: 250
       });
-      statusMessage = `Search finished. ${searchResults.length} result(s).`;
+
+      if (searchIncludeContainers) {
+        searchContainerResults = await invoke<ContainerRecord[]>("search_containers", {
+          pathQuery: searchPath,
+          nameQuery: searchFilename,
+          limit: 250
+        });
+      } else {
+        searchContainerResults = [];
+      }
+
+      statusMessage = `Search finished. ${searchResults.length} file result(s), ${searchContainerResults.length} container result(s).`;
     } catch (error) {
       statusMessage = `Search failed: ${String(error)}`;
     } finally {
@@ -283,6 +359,8 @@
     searchTag = "";
     searchMinRating = "";
     searchResults = [];
+    searchContainerResults = [];
+    searchIncludeContainers = true;
     searchRan = false;
     statusMessage = "Search cleared.";
   }
@@ -523,6 +601,10 @@
         bind:value={searchMinRating}
         disabled={searching || loading}
       />
+      <label class="checkbox-row">
+        <input type="checkbox" bind:checked={searchIncludeContainers} disabled={searching || loading} />
+        Include containers in search target
+      </label>
       <div class="actions">
         <button type="submit" disabled={searching || loading}>
           {searching ? "Searching..." : "Search"}
@@ -534,9 +616,8 @@
     </form>
 
     {#if searchRan}
-      {#if searchResults.length === 0}
-        <p class="muted">No matching files.</p>
-      {:else}
+      {#if searchResults.length > 0}
+        <h3>Files</h3>
         <div class="table-wrap">
           <table>
             <thead>
@@ -577,6 +658,51 @@
             </tbody>
           </table>
         </div>
+      {:else}
+        <p class="muted">No matching files.</p>
+      {/if}
+
+      {#if searchIncludeContainers}
+        {#if searchContainerResults.length > 0}
+          <h3>Containers</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Type</th>
+                  <th>Name</th>
+                  <th>Source Path</th>
+                  <th>Children</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each searchContainerResults as container}
+                  <tr>
+                    <td>{container.id}</td>
+                    <td>{container.container_type}</td>
+                    <td>{container.display_name}</td>
+                    <td class="path">{container.source_path}</td>
+                    <td>{container.child_count}</td>
+                    <td>
+                      <button
+                        type="button"
+                        class="secondary"
+                        onclick={() => openContainerInRecent(container)}
+                        disabled={searching || loading}
+                      >
+                        Open in Recent
+                      </button>
+                    </td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {:else}
+          <p class="muted">No matching containers.</p>
+        {/if}
       {/if}
     {/if}
   </section>
@@ -690,7 +816,10 @@
           </thead>
           <tbody>
             {#each recentContainers as container}
-              <tr>
+              <tr
+                id={`recent-container-row-${container.id}`}
+                class:focused-container-row={focusedContainerId === container.id}
+              >
                 <td>{container.id}</td>
                 <td>{container.container_type}</td>
                 <td>{container.display_name}</td>
@@ -715,14 +844,26 @@
                   {/if}
                 </td>
                 <td>
-                  <button
-                    type="button"
-                    class="secondary"
-                    onclick={() => toggleContainerChildren(container.id)}
-                    disabled={container.child_count === 0}
-                  >
-                    {expandedContainers[container.id] ? "Hide" : "Show"} ({container.child_count})
-                  </button>
+                  <div class="container-actions">
+                    <button
+                      type="button"
+                      class="secondary"
+                      onclick={() => toggleContainerChildren(container.id)}
+                      disabled={container.child_count === 0}
+                    >
+                      {expandedContainers[container.id] ? "Hide" : "Show"} ({container.child_count})
+                    </button>
+                    {#if container.container_type === "archive"}
+                      <button
+                        type="button"
+                        class="secondary"
+                        onclick={() => backfillArchiveContainer(container)}
+                        disabled={!!backfillingThumbs[container.id]}
+                      >
+                        {backfillingThumbs[container.id] ? "Backfilling..." : "Backfill thumbs"}
+                      </button>
+                    {/if}
+                  </div>
                 </td>
               </tr>
               {#if expandedContainers[container.id]}
@@ -985,6 +1126,14 @@
     background: #eef7ff;
   }
 
+  .checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    color: #334155;
+    font-size: 0.9rem;
+  }
+
   .table-wrap {
     overflow: auto;
     border-radius: 12px;
@@ -1049,6 +1198,18 @@
 
   .child-row td {
     background: #f8fafc;
+  }
+
+  .focused-container-row {
+    outline: 2px solid #0f766e;
+    outline-offset: -2px;
+    background: #ecfdf5;
+  }
+
+  .container-actions {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
   }
 
   .container-thumb-grid {

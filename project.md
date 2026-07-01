@@ -110,18 +110,22 @@ This section summarizes the current development state and the mainline implement
   * Archive thumbnail slot generation (up to 16) from extracted images.
   * Container preview grid rendering in UI (compact row preview + expanded view).
   * Additional archive extensions recognized: cbz, cbr, cb7.
+  * Archive thumbnail backfill command for existing records (`backfill_archive_container_thumbnails`).
+  * Per-archive container action button in UI to trigger backfill and refresh grid.
+  * Recent container listing now prioritizes archive containers with fewer than 16 preview slots.
 * Status: in progress.
 * Remaining verification:
-  * Re-register existing archive entries to backfill multi-slot thumbnails.
+  * Verify backfill behavior with existing archive data set in executable run.
 
 ### 8. Thumbnail backfill and maintenance
 
 * Goal: make existing data consistent and keep preview caches healthy.
+* Implemented:
+  * Targeted archive backfill command without full re-scan.
+  * Per-container archive backfill action in UI.
 * Planned:
-  * Add targeted backfill command for archive thumbnails without full re-scan.
   * Add cache maintenance commands (cleanup/orphan removal).
-  * Add per-container refresh action in UI.
-* Status: pending.
+* Status: in progress.
 
 ### 9. Background job system
 
@@ -145,11 +149,18 @@ This section summarizes the current development state and the mainline implement
 ### 11. Combined container UX and search semantics
 
 * Goal: make combined containers first-class in search and browsing.
+* Implemented:
+  * Search now supports containers as a direct search target from the Search panel.
+  * Added frontend toggle to include/exclude container search.
+  * Added container search result listing (ID/type/name/source path/child count).
+  * Added quick action from container search results to open and expand the container in Recent Containers view.
+  * Refined quick action behavior: auto-expand only when the container has children; keep zero-child containers collapsed.
 * Planned:
   * Create and edit combined containers from search and container views.
   * Add search option to hide/show children belonging to combined containers.
+  * Show thumbnail grids (when available) in container search results.
   * Improve child/parent navigation in UI.
-* Status: pending.
+* Status: in progress.
 
 ### 12. Archive and nested container policy
 
