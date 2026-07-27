@@ -6,6 +6,7 @@
     "/^\\$roots = @\\(\\$env:APPDATA, \\$env:LOCALAPPDATA\\); foreach \\(\\$r in \\$roots\\) \\{ if \\(Test-Path \\$r\\) \\{ Get-ChildItem -Path \\$r -Filter thumbscontainer\\.db -Recurse -ErrorAction SilentlyContinue \\| Select-Object -First 5 FullName \\} \\}$/": {
       "approve": true,
       "matchCommandLine": true
-    }
+    },
+    "cargo test": true
   }
 }
