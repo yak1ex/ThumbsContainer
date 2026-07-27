@@ -64,6 +64,17 @@
     skipped_reason: string | null;
   };
 
+  type ThumbnailMaintenanceResult = {
+    dry_run: boolean;
+    referenced_thumbnail_files: number;
+    missing_file_thumbnail_records: number;
+    missing_container_thumbnail_records: number;
+    orphaned_cache_files: number;
+    removed_file_thumbnail_records: number;
+    removed_container_thumbnail_records: number;
+    removed_orphaned_cache_files: number;
+  };
+
   type RegisterProgress = {
     folder_path: string;
     total_files: number;
@@ -91,6 +102,8 @@
   let containerThumbs = $state<Record<number, ContainerThumbnailRecord[]>>({});
   let loadingThumbs = $state<Record<number, boolean>>({});
   let backfillingThumbs = $state<Record<number, boolean>>({});
+  let maintenanceBusy = $state(false);
+  let lastMaintenance = $state<ThumbnailMaintenanceResult | null>(null);
   let searchResults = $state<FileRecord[]>([]);
   let searchContainerResults = $state<ContainerRecord[]>([]);
   let focusedContainerId = $state<number | null>(null);
@@ -282,6 +295,51 @@
       statusMessage = `Archive backfill failed for container ${container.id}: ${String(error)}`;
     } finally {
       backfillingThumbs = { ...backfillingThumbs, [container.id]: false };
+    }
+  }
+
+  function describeMaintenanceResult(result: ThumbnailMaintenanceResult): string {
+    const modeLabel = result.dry_run ? "Inspection" : "Cleanup";
+    return `${modeLabel} finished. Referenced ${result.referenced_thumbnail_files} file(s), missing file records ${result.missing_file_thumbnail_records}, missing container records ${result.missing_container_thumbnail_records}, orphaned cache files ${result.orphaned_cache_files}. Removed file records ${result.removed_file_thumbnail_records}, removed container records ${result.removed_container_thumbnail_records}, removed orphan files ${result.removed_orphaned_cache_files}.`;
+  }
+
+  async function inspectThumbnailCache() {
+    if (maintenanceBusy) {
+      return;
+    }
+
+    maintenanceBusy = true;
+    statusMessage = "Inspecting thumbnail cache...";
+
+    try {
+      const result = await invoke<ThumbnailMaintenanceResult>("inspect_thumbnail_cache");
+      lastMaintenance = result;
+      statusMessage = describeMaintenanceResult(result);
+    } catch (error) {
+      statusMessage = `Thumbnail cache inspection failed: ${String(error)}`;
+    } finally {
+      maintenanceBusy = false;
+    }
+  }
+
+  async function cleanupThumbnailCache() {
+    if (maintenanceBusy) {
+      return;
+    }
+
+    maintenanceBusy = true;
+    statusMessage = "Cleaning thumbnail cache...";
+
+    try {
+      const result = await invoke<ThumbnailMaintenanceResult>("cleanup_thumbnail_cache");
+      lastMaintenance = result;
+      statusMessage = describeMaintenanceResult(result);
+      await loadRecentFiles();
+      await loadRecentContainers();
+    } catch (error) {
+      statusMessage = `Thumbnail cache cleanup failed: ${String(error)}`;
+    } finally {
+      maintenanceBusy = false;
     }
   }
 
@@ -755,6 +813,14 @@
           {cancelRequested ? "Canceling..." : "Cancel"}
         </button>
       </div>
+      <div class="actions">
+        <button type="button" class="secondary" onclick={inspectThumbnailCache} disabled={loading || maintenanceBusy}>
+          {maintenanceBusy ? "Working..." : "Inspect thumbnails"}
+        </button>
+        <button type="button" class="secondary" onclick={cleanupThumbnailCache} disabled={loading || maintenanceBusy}>
+          {maintenanceBusy ? "Working..." : "Cleanup thumbnails"}
+        </button>
+      </div>
     </form>
 
     {#if loading && progress}
@@ -793,6 +859,19 @@
         <p>Group containers updated: <strong>{lastResult.updated_group_containers}</strong></p>
         <p>Thumbnails created: <strong>{lastResult.created_thumbnails}</strong></p>
         <p>Thumbnails updated: <strong>{lastResult.updated_thumbnails}</strong></p>
+      </div>
+    {/if}
+
+    {#if lastMaintenance}
+      <div class="result-grid">
+        <p>Referenced thumbs: <strong>{lastMaintenance.referenced_thumbnail_files}</strong></p>
+        <p>Missing file records: <strong>{lastMaintenance.missing_file_thumbnail_records}</strong></p>
+        <p>Missing container records: <strong>{lastMaintenance.missing_container_thumbnail_records}</strong></p>
+        <p>Orphan cache files: <strong>{lastMaintenance.orphaned_cache_files}</strong></p>
+        <p>Removed file records: <strong>{lastMaintenance.removed_file_thumbnail_records}</strong></p>
+        <p>Removed container records: <strong>{lastMaintenance.removed_container_thumbnail_records}</strong></p>
+        <p>Removed orphan files: <strong>{lastMaintenance.removed_orphaned_cache_files}</strong></p>
+        <p>Mode: <strong>{lastMaintenance.dry_run ? "Inspect" : "Cleanup"}</strong></p>
       </div>
     {/if}
   </section>

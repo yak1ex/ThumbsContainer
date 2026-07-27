@@ -113,9 +113,9 @@ This section summarizes the current development state and the mainline implement
   * Archive thumbnail backfill command for existing records (`backfill_archive_container_thumbnails`).
   * Per-archive container action button in UI to trigger backfill and refresh grid.
   * Recent container listing now prioritizes archive containers with fewer than 16 preview slots.
-* Status: in progress.
-* Remaining verification:
-  * Verify backfill behavior with existing archive data set in executable run.
+* Status: completed.
+* Notes:
+  * Executable verification completed on existing archive data set; backfill action and status flow confirmed.
 
 ### 8. Thumbnail backfill and maintenance
 
@@ -123,9 +123,13 @@ This section summarizes the current development state and the mainline implement
 * Implemented:
   * Targeted archive backfill command without full re-scan.
   * Per-container archive backfill action in UI.
-* Planned:
-  * Add cache maintenance commands (cleanup/orphan removal).
-* Status: in progress.
+  * Thumbnail cache inspection command for stale DB records and orphaned cache files.
+  * Thumbnail cache cleanup command for missing-record pruning and orphaned file removal.
+  * Minimal UI actions to inspect and clean thumbnail cache, with result summary and list refresh.
+* Status: completed.
+* Notes:
+  * Baseline executable verification completed (normal dataset: inspect/cleanup reported zero stale records and zero orphaned files).
+  * Injected stale-data verification completed: inspect reported missing file records, missing container records, and orphaned cache files; cleanup removed the reported stale records/files and returned all stale counters to zero.
 
 ### 9. Background job system
 
@@ -196,4 +200,25 @@ This section summarizes the current development state and the mainline implement
   * Add backend tests for registration, dedupe candidate generation, and thumbnail paths.
   * Add frontend smoke/regression tests for search, progress, and container previews.
   * Add packaging/release checklist for Windows builds and upgrade safety.
+* Status: pending.
+
+### 16. Archive backfill diagnostics UX
+
+* Goal: make archive backfill outcomes explainable in-app when previews are not generated.
+* Implemented:
+  * Backend archive thumbnail generation now returns explicit no-preview reasons (extractor missing, extraction failure, no images found, generation failure).
+  * Archive backfill command now surfaces explicit skipped reasons when zero slots are generated.
+  * Existing successful backfill messaging path remains unchanged in UI.
+* Status: completed.
+* Notes:
+  * Executable verification confirmed explicit reason messaging for no-preview archives (for example: "no image files found in archive").
+  * Executable verification also confirmed successful path messaging remains unchanged for containers with generated previews.
+
+### 17. Archive image candidate detection robustness
+
+* Goal: reduce false "no image files found in archive" outcomes when archives contain nested image files.
+* Planned:
+  * Add richer diagnostics for no-image outcomes (for example: extracted file count and sampled extensions) to distinguish true no-image archives from detection gaps.
+  * Review image candidate matching for edge cases in archive contents (extension variants, naming quirks, nested structures).
+  * Add at least one regression test case for nested archive image structures that previously reported no images.
 * Status: pending.

@@ -80,6 +80,18 @@ struct ArchiveBackfillResult {
     skipped_reason: Option<String>,
 }
 
+#[derive(Serialize)]
+struct ThumbnailMaintenanceResult {
+    dry_run: bool,
+    referenced_thumbnail_files: usize,
+    missing_file_thumbnail_records: usize,
+    missing_container_thumbnail_records: usize,
+    orphaned_cache_files: usize,
+    removed_file_thumbnail_records: usize,
+    removed_container_thumbnail_records: usize,
+    removed_orphaned_cache_files: usize,
+}
+
 struct ContainerUpsertOutcome {
     created: bool,
     container_id: i64,
@@ -269,12 +281,7 @@ fn thumbnail_cache_path(app: &tauri::AppHandle, file_hash: &str, size: i64) -> R
     Ok(thumb_dir.join(format!("{file_hash}_{size}.png")))
 }
 
-fn thumbnail_cache_path_for_slot(
-    app: &tauri::AppHandle,
-    file_hash: &str,
-    size: i64,
-    slot_index: i64,
-) -> Result<PathBuf, String> {
+fn thumbnail_cache_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let app_data = app
         .path()
         .app_data_dir()
@@ -282,8 +289,135 @@ fn thumbnail_cache_path_for_slot(
     let thumb_dir = app_data.join("thumbnails");
     std::fs::create_dir_all(&thumb_dir)
         .map_err(|e| format!("failed to create thumbnail dir {:?}: {e}", thumb_dir))?;
+    Ok(thumb_dir)
+}
 
+fn thumbnail_cache_path_for_slot(
+    app: &tauri::AppHandle,
+    file_hash: &str,
+    size: i64,
+    slot_index: i64,
+) -> Result<PathBuf, String> {
+    let thumb_dir = thumbnail_cache_dir(app)?;
     Ok(thumb_dir.join(format!("{file_hash}_{size}_s{slot_index}.png")))
+}
+
+fn collect_referenced_thumbnail_paths(conn: &Connection) -> Result<HashSet<PathBuf>, String> {
+    let mut paths = HashSet::new();
+
+    let mut file_stmt = conn
+        .prepare("SELECT thumbnail_path FROM thumbnails")
+        .map_err(|e| format!("failed to prepare file thumbnail query: {e}"))?;
+    let file_rows = file_stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("failed to query file thumbnails: {e}"))?;
+    for row in file_rows {
+        paths.insert(PathBuf::from(
+            row.map_err(|e| format!("failed to map file thumbnail row: {e}"))?,
+        ));
+    }
+
+    let mut container_stmt = conn
+        .prepare("SELECT thumbnail_path FROM container_thumbnails")
+        .map_err(|e| format!("failed to prepare container thumbnail query: {e}"))?;
+    let container_rows = container_stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("failed to query container thumbnails: {e}"))?;
+    for row in container_rows {
+        paths.insert(PathBuf::from(
+            row.map_err(|e| format!("failed to map container thumbnail row: {e}"))?,
+        ));
+    }
+
+    Ok(paths)
+}
+
+fn collect_missing_file_thumbnail_record_ids(conn: &Connection) -> Result<Vec<i64>, String> {
+    let mut stmt = conn
+        .prepare("SELECT file_id, thumbnail_path FROM thumbnails")
+        .map_err(|e| format!("failed to prepare file thumbnail scan: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|e| format!("failed to query file thumbnail scan: {e}"))?;
+
+    let mut missing = Vec::new();
+    for row in rows {
+        let (file_id, path) = row.map_err(|e| format!("failed to map file thumbnail scan row: {e}"))?;
+        if !Path::new(&path).exists() {
+            missing.push(file_id);
+        }
+    }
+    Ok(missing)
+}
+
+fn collect_missing_container_thumbnail_keys(conn: &Connection) -> Result<Vec<(i64, i64)>, String> {
+    let mut stmt = conn
+        .prepare("SELECT container_id, slot_index, thumbnail_path FROM container_thumbnails")
+        .map_err(|e| format!("failed to prepare container thumbnail scan: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| format!("failed to query container thumbnail scan: {e}"))?;
+
+    let mut missing = Vec::new();
+    for row in rows {
+        let (container_id, slot_index, path) =
+            row.map_err(|e| format!("failed to map container thumbnail scan row: {e}"))?;
+        if !Path::new(&path).exists() {
+            missing.push((container_id, slot_index));
+        }
+    }
+    Ok(missing)
+}
+
+fn list_thumbnail_cache_files(app: &tauri::AppHandle) -> Result<Vec<PathBuf>, String> {
+    let thumb_dir = thumbnail_cache_dir(app)?;
+    let mut files = Vec::new();
+
+    let entries = std::fs::read_dir(&thumb_dir)
+        .map_err(|e| format!("failed to read thumbnail dir {:?}: {e}", thumb_dir))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("failed to read thumbnail dir entry: {e}"))?;
+        let path = entry.path();
+        if path.is_file() {
+            files.push(path);
+        }
+    }
+
+    Ok(files)
+}
+
+fn build_thumbnail_maintenance_result(
+    conn: &Connection,
+    cache_files: &[PathBuf],
+    dry_run: bool,
+    removed_file_thumbnail_records: usize,
+    removed_container_thumbnail_records: usize,
+    removed_orphaned_cache_files: usize,
+) -> Result<ThumbnailMaintenanceResult, String> {
+    let referenced_paths = collect_referenced_thumbnail_paths(conn)?;
+    let missing_file_thumbnail_records = collect_missing_file_thumbnail_record_ids(conn)?;
+    let missing_container_thumbnail_records = collect_missing_container_thumbnail_keys(conn)?;
+    let orphaned_cache_files = cache_files
+        .iter()
+        .filter(|path| !referenced_paths.contains(*path))
+        .count();
+
+    Ok(ThumbnailMaintenanceResult {
+        dry_run,
+        referenced_thumbnail_files: referenced_paths.len(),
+        missing_file_thumbnail_records: missing_file_thumbnail_records.len(),
+        missing_container_thumbnail_records: missing_container_thumbnail_records.len(),
+        orphaned_cache_files,
+        removed_file_thumbnail_records,
+        removed_container_thumbnail_records,
+        removed_orphaned_cache_files,
+    })
 }
 
 fn probe_video_duration_seconds(file_path: &str) -> Option<f64> {
@@ -380,14 +514,19 @@ fn generate_archive_thumbnail_set(
     file_hash: &str,
     size: i64,
     slots: i64,
-) -> Result<Vec<(i64, String)>, String> {
+) -> Result<(Vec<(i64, String)>, Option<String>), String> {
     if slots <= 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Some("no thumbnail slots requested".to_string())));
     }
 
     let extractor = match find_archive_extractor() {
         Some(v) => v,
-        None => return Ok(Vec::new()),
+        None => {
+            return Ok((
+                Vec::new(),
+                Some("archive extractor not found (7z/7za)".to_string()),
+            ));
+        }
     };
 
     let app_data = app
@@ -413,7 +552,7 @@ fn generate_archive_thumbnail_set(
 
     match extract_status {
         Ok(output) if output.status.success() => {}
-        _ => return Ok(Vec::new()),
+        _ => return Ok((Vec::new(), Some("archive extraction failed".to_string()))),
     }
 
     let mut image_candidates: Vec<PathBuf> = Vec::new();
@@ -434,7 +573,7 @@ fn generate_archive_thumbnail_set(
 
     image_candidates.sort();
     if image_candidates.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Some("no image files found in archive".to_string())));
     }
 
     let mut generated = Vec::new();
@@ -465,7 +604,14 @@ fn generate_archive_thumbnail_set(
         }
     }
 
-    Ok(generated)
+    if generated.is_empty() {
+        return Ok((
+            generated,
+            Some("failed to generate thumbnails from extracted images".to_string()),
+        ));
+    }
+
+    Ok((generated, None))
 }
 
 fn generate_thumbnail_for_file(
@@ -1145,7 +1291,7 @@ fn register_folder_blocking(
                     let _ = upsert_container_thumbnail(&conn, outcome.container_id, 0, &thumbnail_path)?;
                 }
             } else if detect_container_type(&filename) == "archive" {
-                let slots = generate_archive_thumbnail_set(app, &path_text, &hash, size_i64, 16)?;
+                let (slots, _) = generate_archive_thumbnail_set(app, &path_text, &hash, size_i64, 16)?;
                 for (slot_index, thumb_path) in &slots {
                     let _ = upsert_container_thumbnail(&conn, outcome.container_id, *slot_index, thumb_path)?;
                 }
@@ -1210,7 +1356,7 @@ fn register_folder_blocking(
                     let _ = upsert_container_thumbnail(&conn, outcome.container_id, 0, &thumbnail_path)?;
                 }
             } else if detect_container_type(&filename) == "archive" {
-                let slots = generate_archive_thumbnail_set(app, &path_text, &hash, size_i64, 16)?;
+                let (slots, _) = generate_archive_thumbnail_set(app, &path_text, &hash, size_i64, 16)?;
                 for (slot_index, thumb_path) in &slots {
                     let _ = upsert_container_thumbnail(&conn, outcome.container_id, *slot_index, thumb_path)?;
                 }
@@ -1474,7 +1620,20 @@ fn backfill_archive_container_thumbnails(
         });
     }
 
-    let slots = generate_archive_thumbnail_set(&app, &file_path, &file_hash, file_size, 16)?;
+    let (slots, generation_reason) =
+        generate_archive_thumbnail_set(&app, &file_path, &file_hash, file_size, 16)?;
+    if slots.is_empty() {
+        return Ok(ArchiveBackfillResult {
+            container_id,
+            generated_slots: 0,
+            updated_slots: 0,
+            updated_file_thumbnail: false,
+            skipped_reason: Some(
+                generation_reason.unwrap_or_else(|| "no thumbnails generated".to_string()),
+            ),
+        });
+    }
+
     let mut updated_slots = 0usize;
     for (slot_index, thumb_path) in &slots {
         if upsert_container_thumbnail(&conn, container_id, *slot_index, thumb_path)? {
@@ -1502,6 +1661,69 @@ fn backfill_archive_container_thumbnails(
         updated_file_thumbnail,
         skipped_reason: None,
     })
+}
+
+#[tauri::command]
+fn inspect_thumbnail_cache(app: tauri::AppHandle) -> Result<ThumbnailMaintenanceResult, String> {
+    let conn = open_db(&app)?;
+    let cache_files = list_thumbnail_cache_files(&app)?;
+    build_thumbnail_maintenance_result(&conn, &cache_files, true, 0, 0, 0)
+}
+
+#[tauri::command]
+fn cleanup_thumbnail_cache(app: tauri::AppHandle) -> Result<ThumbnailMaintenanceResult, String> {
+    let mut conn = open_db(&app)?;
+    let cache_files = list_thumbnail_cache_files(&app)?;
+    let missing_file_thumbnail_ids = collect_missing_file_thumbnail_record_ids(&conn)?;
+    let missing_container_thumbnail_keys = collect_missing_container_thumbnail_keys(&conn)?;
+    let referenced_paths = collect_referenced_thumbnail_paths(&conn)?;
+
+    let orphaned_cache_files: Vec<PathBuf> = cache_files
+        .iter()
+        .filter(|path| !referenced_paths.contains(*path))
+        .cloned()
+        .collect();
+
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("failed to start thumbnail maintenance transaction: {e}"))?;
+
+    for file_id in &missing_file_thumbnail_ids {
+        tx.execute("DELETE FROM thumbnails WHERE file_id = ?", [file_id])
+            .map_err(|e| format!("failed to delete missing file thumbnail record {file_id}: {e}"))?;
+    }
+
+    for (container_id, slot_index) in &missing_container_thumbnail_keys {
+        tx.execute(
+            "DELETE FROM container_thumbnails WHERE container_id = ? AND slot_index = ?",
+            params![container_id, slot_index],
+        )
+        .map_err(|e| {
+            format!(
+                "failed to delete missing container thumbnail record ({container_id}, {slot_index}): {e}"
+            )
+        })?;
+    }
+
+    tx.commit()
+        .map_err(|e| format!("failed to commit thumbnail maintenance transaction: {e}"))?;
+
+    let mut removed_orphaned_cache_files = 0usize;
+    for path in &orphaned_cache_files {
+        std::fs::remove_file(path)
+            .map_err(|e| format!("failed to remove orphaned thumbnail {:?}: {e}", path))?;
+        removed_orphaned_cache_files += 1;
+    }
+
+    let refreshed_cache_files = list_thumbnail_cache_files(&app)?;
+    build_thumbnail_maintenance_result(
+        &conn,
+        &refreshed_cache_files,
+        false,
+        missing_file_thumbnail_ids.len(),
+        missing_container_thumbnail_keys.len(),
+        removed_orphaned_cache_files,
+    )
 }
 
 #[tauri::command]
@@ -1861,6 +2083,8 @@ pub fn run() {
             list_container_children,
             list_container_thumbnails,
             backfill_archive_container_thumbnails,
+            inspect_thumbnail_cache,
+            cleanup_thumbnail_cache,
             search_files,
             search_containers,
             get_file_classification,
