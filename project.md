@@ -99,6 +99,7 @@ This section summarizes the current development state and the mainline implement
 * Implemented:
   * Image thumbnails.
   * Video multi-slot thumbnails (up to 16 slots).
+  * Video thumbnails are sampled at equal time intervals across clip duration.
   * Data URL delivery from backend to avoid frontend file loading issues.
 * Status: completed.
 
@@ -134,11 +135,19 @@ This section summarizes the current development state and the mainline implement
 ### 9. Background job system
 
 * Goal: isolate heavy tasks from interactive flows.
-* Planned:
-  * Introduce background queue for thumbnail generation and rebuild tasks.
-  * Separate registration completion from asynchronous thumbnail completion.
-  * Add job status and progress events for UI.
-* Status: pending.
+* Implemented:
+  * Added backend background thumbnail job queue with serialized task processing.
+  * Registration now completes after metadata/container persistence while thumbnail generation runs asynchronously in background jobs.
+  * Added background job progress events (`thumbnail-job-progress`) with per-job task counts and last-error reporting.
+  * Added frontend listener and UI summaries for queued thumbnail tasks and background job progress.
+  * Added background group-thumbnail rebuild task execution at the end of each registration job.
+  * Fixed post-job container preview refresh by forcing thumbnail reload for `Recent Containers` when background jobs finish.
+  * Added debug-only deterministic failure injection for background thumbnail tasks via path marker matching (`__fail_bg__` by default, override with `THUMBS_BG_FAIL_MARKER`).
+  * Fixed background progress reporting to preserve the most recent task failure in `Last error` through final completion event.
+* Status: completed.
+* Notes:
+  * Executable success-path verification completed: registration progress, queued task display, background job progress updates, completion summary, and Recent Containers preview refresh confirmed.
+  * Executable failure-path verification completed with deterministic marker injection: registration remained non-blocking while background job reported failed tasks and a persistent final `Last error` value.
 
 ### 10. Dedupe workflow (user-driven)
 

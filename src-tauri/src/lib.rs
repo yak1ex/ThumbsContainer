@@ -2,16 +2,18 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
 use walkdir::WalkDir;
 
 const REGISTER_CANCELLED: &str = "register_cancelled";
+const THUMBNAIL_JOB_PROGRESS_EVENT: &str = "thumbnail-job-progress";
+const DEFAULT_BG_FAIL_MARKER: &str = "__fail_bg__";
 
 #[derive(Serialize)]
 struct RegisterResult {
@@ -25,7 +27,71 @@ struct RegisterResult {
     updated_group_containers: usize,
     created_thumbnails: usize,
     updated_thumbnails: usize,
+    queued_thumbnail_tasks: usize,
+    background_job_id: Option<u64>,
     canceled: bool,
+}
+
+#[derive(Serialize, Clone)]
+struct ThumbnailJobProgress {
+    job_id: u64,
+    folder_path: String,
+    total_tasks: usize,
+    completed_tasks: usize,
+    succeeded_tasks: usize,
+    failed_tasks: usize,
+    current_item: Option<String>,
+    last_error: Option<String>,
+    done: bool,
+}
+
+#[derive(Clone)]
+enum ThumbnailTaskKind {
+    Image,
+    Video,
+    Archive,
+}
+
+#[derive(Clone)]
+struct ThumbnailFileTask {
+    file_id: i64,
+    container_id: i64,
+    file_path: String,
+    file_hash: String,
+    file_size: i64,
+    kind: ThumbnailTaskKind,
+}
+
+#[derive(Clone)]
+enum BackgroundThumbnailTask {
+    Generate(ThumbnailFileTask),
+    RebuildGroups {
+        folder_path: String,
+        max_slots: i64,
+    },
+}
+
+struct ThumbnailJob {
+    id: u64,
+    folder_path: String,
+    tasks: Vec<BackgroundThumbnailTask>,
+}
+
+#[derive(Default)]
+struct ThumbnailJobQueueInner {
+    jobs: Mutex<VecDeque<ThumbnailJob>>,
+    worker_running: AtomicBool,
+    next_job_id: AtomicU64,
+}
+
+#[derive(Clone, Default)]
+struct ThumbnailJobQueue {
+    inner: Arc<ThumbnailJobQueueInner>,
+}
+
+struct RegisterBlockingOutcome {
+    result: RegisterResult,
+    thumbnail_tasks: Vec<BackgroundThumbnailTask>,
 }
 
 #[derive(Serialize)]
@@ -1157,11 +1223,302 @@ fn emit_register_progress(app: &tauri::AppHandle, progress: &RegisterProgress) {
     let _ = app.emit("register-progress", progress.clone());
 }
 
+fn emit_thumbnail_job_progress(app: &tauri::AppHandle, progress: &ThumbnailJobProgress) {
+    let _ = app.emit(THUMBNAIL_JOB_PROGRESS_EVENT, progress.clone());
+}
+
+impl ThumbnailJobQueue {
+    fn enqueue_job(
+        &self,
+        folder_path: String,
+        tasks: Vec<BackgroundThumbnailTask>,
+    ) -> Result<Option<u64>, String> {
+        if tasks.is_empty() {
+            return Ok(None);
+        }
+
+        let id = self
+            .inner
+            .next_job_id
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+
+        let mut jobs = self
+            .inner
+            .jobs
+            .lock()
+            .map_err(|_| "failed to lock thumbnail job queue".to_string())?;
+        jobs.push_back(ThumbnailJob {
+            id,
+            folder_path,
+            tasks,
+        });
+        Ok(Some(id))
+    }
+
+    fn pop_job(&self) -> Option<ThumbnailJob> {
+        let mut jobs = self.inner.jobs.lock().ok()?;
+        jobs.pop_front()
+    }
+
+    fn ensure_worker(&self, app: tauri::AppHandle) {
+        if self
+            .inner
+            .worker_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let queue = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let app_handle = app.clone();
+            let queue_for_worker = queue.clone();
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                while let Some(job) = queue_for_worker.pop_job() {
+                    process_thumbnail_job(&app_handle, job);
+                }
+            })
+            .await;
+
+            queue.inner.worker_running.store(false, Ordering::SeqCst);
+
+            if let Some(job) = queue.pop_job() {
+                if let Ok(mut jobs) = queue.inner.jobs.lock() {
+                    jobs.push_front(job);
+                }
+                queue.ensure_worker(app);
+            }
+        });
+    }
+}
+
+fn enqueue_thumbnail_task(
+    tasks: &mut Vec<BackgroundThumbnailTask>,
+    file_id: i64,
+    container_id: i64,
+    path_text: &str,
+    hash: &str,
+    size_i64: i64,
+    filename: &str,
+) {
+    let kind = if let Some(v) = detect_thumbnailable_kind(filename) {
+        if v == "video" {
+            Some(ThumbnailTaskKind::Video)
+        } else {
+            Some(ThumbnailTaskKind::Image)
+        }
+    } else if detect_container_type(filename) == "archive" {
+        Some(ThumbnailTaskKind::Archive)
+    } else {
+        None
+    };
+
+    if let Some(kind) = kind {
+        tasks.push(BackgroundThumbnailTask::Generate(ThumbnailFileTask {
+            file_id,
+            container_id,
+            file_path: path_text.to_string(),
+            file_hash: hash.to_string(),
+            file_size: size_i64,
+            kind,
+        }));
+    }
+}
+
+fn background_fail_marker_for_debug() -> Option<String> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+
+    let marker = std::env::var("THUMBS_BG_FAIL_MARKER")
+        .unwrap_or_else(|_| DEFAULT_BG_FAIL_MARKER.to_string())
+        .trim()
+        .to_string();
+
+    if marker.is_empty() {
+        None
+    } else {
+        Some(marker)
+    }
+}
+
+fn injected_background_task_error(file_path: &str) -> Option<String> {
+    let marker = background_fail_marker_for_debug()?;
+    let path_lower = file_path.to_ascii_lowercase();
+    let marker_lower = marker.to_ascii_lowercase();
+    if path_lower.contains(&marker_lower) {
+        Some(format!(
+            "injected background thumbnail failure for testing (marker: {marker})"
+        ))
+    } else {
+        None
+    }
+}
+
+fn process_thumbnail_file_task(
+    app: &tauri::AppHandle,
+    conn: &Connection,
+    task: &ThumbnailFileTask,
+) -> Result<(), String> {
+    if let Some(err) = injected_background_task_error(&task.file_path) {
+        return Err(err);
+    }
+
+    if !Path::new(&task.file_path).exists() {
+        return Err("source file does not exist".to_string());
+    }
+
+    match task.kind {
+        ThumbnailTaskKind::Video => {
+            let slots = generate_video_thumbnail_set(
+                app,
+                &task.file_path,
+                &task.file_hash,
+                task.file_size,
+                16,
+            )?;
+            if slots.is_empty() {
+                return Err("no video thumbnails generated".to_string());
+            }
+            for (slot_index, thumb_path) in &slots {
+                let _ = upsert_container_thumbnail(conn, task.container_id, *slot_index, thumb_path)?;
+            }
+            if let Some((_, primary)) = slots.first() {
+                let _ = upsert_thumbnail(conn, task.file_id, primary)?;
+            }
+        }
+        ThumbnailTaskKind::Image => {
+            if let Some(thumbnail_path) =
+                generate_thumbnail_for_file(app, &task.file_path, &task.file_hash, task.file_size, "image")?
+            {
+                let _ = upsert_thumbnail(conn, task.file_id, &thumbnail_path)?;
+                let _ = upsert_container_thumbnail(conn, task.container_id, 0, &thumbnail_path)?;
+            } else {
+                return Err("no image thumbnail generated".to_string());
+            }
+        }
+        ThumbnailTaskKind::Archive => {
+            let (slots, reason) = generate_archive_thumbnail_set(
+                app,
+                &task.file_path,
+                &task.file_hash,
+                task.file_size,
+                16,
+            )?;
+            if slots.is_empty() {
+                return Err(reason.unwrap_or_else(|| "no archive thumbnails generated".to_string()));
+            }
+            for (slot_index, thumb_path) in &slots {
+                let _ = upsert_container_thumbnail(conn, task.container_id, *slot_index, thumb_path)?;
+            }
+            if let Some((_, primary)) = slots.first() {
+                let _ = upsert_thumbnail(conn, task.file_id, primary)?;
+            }
+        }
+    }
+
+    conn.execute(
+        "UPDATE containers SET updated_at = datetime('now') WHERE id = ?",
+        [task.container_id],
+    )
+    .map_err(|e| format!("failed to update container timestamp for {}: {e}", task.container_id))?;
+
+    Ok(())
+}
+
+fn process_thumbnail_job(app: &tauri::AppHandle, job: ThumbnailJob) {
+    let total_tasks = job.tasks.len();
+    let mut completed_tasks = 0usize;
+    let mut succeeded_tasks = 0usize;
+    let mut failed_tasks = 0usize;
+    let mut last_error_message: Option<String> = None;
+
+    let conn = match open_db(app) {
+        Ok(conn) => conn,
+        Err(err) => {
+            emit_thumbnail_job_progress(
+                app,
+                &ThumbnailJobProgress {
+                    job_id: job.id,
+                    folder_path: job.folder_path,
+                    total_tasks,
+                    completed_tasks: total_tasks,
+                    succeeded_tasks: 0,
+                    failed_tasks: total_tasks,
+                    current_item: None,
+                    last_error: Some(err),
+                    done: true,
+                },
+            );
+            return;
+        }
+    };
+
+    emit_thumbnail_job_progress(
+        app,
+        &ThumbnailJobProgress {
+            job_id: job.id,
+            folder_path: job.folder_path.clone(),
+            total_tasks,
+            completed_tasks,
+            succeeded_tasks,
+            failed_tasks,
+            current_item: None,
+            last_error: None,
+            done: false,
+        },
+    );
+
+    for task in job.tasks {
+        let current_item = match &task {
+            BackgroundThumbnailTask::Generate(file_task) => Some(file_task.file_path.clone()),
+            BackgroundThumbnailTask::RebuildGroups { folder_path, .. } => {
+                Some(format!("rebuild_group_thumbnails:{folder_path}"))
+            }
+        };
+
+        let task_result = match task {
+            BackgroundThumbnailTask::Generate(file_task) => {
+                process_thumbnail_file_task(app, &conn, &file_task)
+            }
+            BackgroundThumbnailTask::RebuildGroups {
+                folder_path,
+                max_slots,
+            } => rebuild_group_container_thumbnail_slots(&conn, &folder_path, max_slots),
+        };
+
+        completed_tasks += 1;
+        if let Err(err) = task_result {
+            failed_tasks += 1;
+            last_error_message = Some(err);
+        } else {
+            succeeded_tasks += 1;
+        }
+
+        emit_thumbnail_job_progress(
+            app,
+            &ThumbnailJobProgress {
+                job_id: job.id,
+                folder_path: job.folder_path.clone(),
+                total_tasks,
+                completed_tasks,
+                succeeded_tasks,
+                failed_tasks,
+                current_item,
+                last_error: last_error_message.clone(),
+                done: completed_tasks >= total_tasks,
+            },
+        );
+    }
+}
+
 fn register_folder_blocking(
     app: &tauri::AppHandle,
     folder_path: &str,
     cancel_flag: Arc<AtomicBool>,
-) -> Result<RegisterResult, String> {
+) -> Result<RegisterBlockingOutcome, String> {
     let path = Path::new(folder_path);
     if !path.exists() || !path.is_dir() {
         return Err("folder_path does not exist or is not a directory".to_string());
@@ -1186,8 +1543,12 @@ fn register_folder_blocking(
         updated_group_containers: 0,
         created_thumbnails: 0,
         updated_thumbnails: 0,
+        queued_thumbnail_tasks: 0,
+        background_job_id: None,
         canceled: false,
     };
+
+    let mut thumbnail_tasks: Vec<BackgroundThumbnailTask> = Vec::new();
 
     emit_register_progress(
         app,
@@ -1322,42 +1683,15 @@ fn register_folder_blocking(
                 result.updated_containers += 1;
             }
 
-            if let Some(kind) = detect_thumbnailable_kind(&filename) {
-                if kind == "video" {
-                    let slots = generate_video_thumbnail_set(app, &path_text, &hash, size_i64, 16)?;
-                    for (slot_index, thumb_path) in &slots {
-                        let _ = upsert_container_thumbnail(&conn, outcome.container_id, *slot_index, thumb_path)?;
-                    }
-                    if let Some((_, primary)) = slots.first() {
-                        if upsert_thumbnail(&conn, moved_file_id, primary)? {
-                            result.updated_thumbnails += 1;
-                        } else {
-                            result.created_thumbnails += 1;
-                        }
-                    }
-                } else if let Some(thumbnail_path) =
-                    generate_thumbnail_for_file(app, &path_text, &hash, size_i64, kind)?
-                {
-                    if upsert_thumbnail(&conn, moved_file_id, &thumbnail_path)? {
-                        result.updated_thumbnails += 1;
-                    } else {
-                        result.created_thumbnails += 1;
-                    }
-                    let _ = upsert_container_thumbnail(&conn, outcome.container_id, 0, &thumbnail_path)?;
-                }
-            } else if detect_container_type(&filename) == "archive" {
-                let (slots, _) = generate_archive_thumbnail_set(app, &path_text, &hash, size_i64, 16)?;
-                for (slot_index, thumb_path) in &slots {
-                    let _ = upsert_container_thumbnail(&conn, outcome.container_id, *slot_index, thumb_path)?;
-                }
-                if let Some((_, primary)) = slots.first() {
-                    if upsert_thumbnail(&conn, moved_file_id, primary)? {
-                        result.updated_thumbnails += 1;
-                    } else {
-                        result.created_thumbnails += 1;
-                    }
-                }
-            }
+            enqueue_thumbnail_task(
+                &mut thumbnail_tasks,
+                moved_file_id,
+                outcome.container_id,
+                &path_text,
+                &hash,
+                size_i64,
+                &filename,
+            );
 
             continue;
         }
@@ -1387,42 +1721,15 @@ fn register_folder_blocking(
                 result.updated_containers += 1;
             }
 
-            if let Some(kind) = detect_thumbnailable_kind(&filename) {
-                if kind == "video" {
-                    let slots = generate_video_thumbnail_set(app, &path_text, &hash, size_i64, 16)?;
-                    for (slot_index, thumb_path) in &slots {
-                        let _ = upsert_container_thumbnail(&conn, outcome.container_id, *slot_index, thumb_path)?;
-                    }
-                    if let Some((_, primary)) = slots.first() {
-                        if upsert_thumbnail(&conn, inserted_file_id, primary)? {
-                            result.updated_thumbnails += 1;
-                        } else {
-                            result.created_thumbnails += 1;
-                        }
-                    }
-                } else if let Some(thumbnail_path) =
-                    generate_thumbnail_for_file(app, &path_text, &hash, size_i64, kind)?
-                {
-                    if upsert_thumbnail(&conn, inserted_file_id, &thumbnail_path)? {
-                        result.updated_thumbnails += 1;
-                    } else {
-                        result.created_thumbnails += 1;
-                    }
-                    let _ = upsert_container_thumbnail(&conn, outcome.container_id, 0, &thumbnail_path)?;
-                }
-            } else if detect_container_type(&filename) == "archive" {
-                let (slots, _) = generate_archive_thumbnail_set(app, &path_text, &hash, size_i64, 16)?;
-                for (slot_index, thumb_path) in &slots {
-                    let _ = upsert_container_thumbnail(&conn, outcome.container_id, *slot_index, thumb_path)?;
-                }
-                if let Some((_, primary)) = slots.first() {
-                    if upsert_thumbnail(&conn, inserted_file_id, primary)? {
-                        result.updated_thumbnails += 1;
-                    } else {
-                        result.created_thumbnails += 1;
-                    }
-                }
-            }
+            enqueue_thumbnail_task(
+                &mut thumbnail_tasks,
+                inserted_file_id,
+                outcome.container_id,
+                &path_text,
+                &hash,
+                size_i64,
+                &filename,
+            );
         }
 
         if result.scanned_files % 25 == 0 || result.scanned_files == total_files {
@@ -1466,10 +1773,18 @@ fn register_folder_blocking(
         let grouping = rebuild_image_group_containers(&conn, folder_path)?;
         result.created_group_containers = grouping.created;
         result.updated_group_containers = grouping.updated;
-        rebuild_group_container_thumbnail_slots(&conn, folder_path, 16)?;
+        thumbnail_tasks.push(BackgroundThumbnailTask::RebuildGroups {
+            folder_path: folder_path.to_string(),
+            max_slots: 16,
+        });
     }
 
-    Ok(result)
+    result.queued_thumbnail_tasks = thumbnail_tasks.len();
+
+    Ok(RegisterBlockingOutcome {
+        result,
+        thumbnail_tasks,
+    })
 }
 
 #[tauri::command]
@@ -1785,6 +2100,7 @@ fn cleanup_thumbnail_cache(app: tauri::AppHandle) -> Result<ThumbnailMaintenance
 async fn register_folder(
     app: tauri::AppHandle,
     register_control: tauri::State<'_, RegisterControl>,
+    thumbnail_jobs: tauri::State<'_, ThumbnailJobQueue>,
     folder_path: String,
 ) -> Result<RegisterResult, String> {
     let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -1797,8 +2113,9 @@ async fn register_folder(
     }
 
     let app_handle = app.clone();
+    let register_folder_path = folder_path.clone();
     let join_result = tauri::async_runtime::spawn_blocking(move || {
-        register_folder_blocking(&app_handle, &folder_path, cancel_flag)
+        register_folder_blocking(&app_handle, &register_folder_path, cancel_flag)
     })
         .await
         .map_err(|e| format!("registration task failed to join: {e}"));
@@ -1811,7 +2128,17 @@ async fn register_folder(
         *guard = None;
     }
 
-    join_result?
+    let mut outcome = join_result??;
+
+    if !outcome.result.canceled {
+        let job_id = thumbnail_jobs.enqueue_job(folder_path, outcome.thumbnail_tasks)?;
+        outcome.result.background_job_id = job_id;
+        if job_id.is_some() {
+            thumbnail_jobs.ensure_worker(app);
+        }
+    }
+
+    Ok(outcome.result)
 }
 
 #[tauri::command]
@@ -2127,6 +2454,7 @@ fn save_file_classification(
 pub fn run() {
     tauri::Builder::default()
         .manage(RegisterControl::default())
+        .manage(ThumbnailJobQueue::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![

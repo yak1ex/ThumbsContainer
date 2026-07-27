@@ -15,7 +15,21 @@
     updated_group_containers: number;
     created_thumbnails: number;
     updated_thumbnails: number;
+    queued_thumbnail_tasks: number;
+    background_job_id: number | null;
     canceled: boolean;
+  };
+
+  type ThumbnailJobProgress = {
+    job_id: number;
+    folder_path: string;
+    total_tasks: number;
+    completed_tasks: number;
+    succeeded_tasks: number;
+    failed_tasks: number;
+    current_item: string | null;
+    last_error: string | null;
+    done: boolean;
   };
 
   type FileRecord = {
@@ -125,6 +139,7 @@
   let currentFileEtaStartMs = $state<number | null>(null);
   let currentFileEtaStartBytes = $state(0);
   let currentFileEtaSeconds = $state<number | null>(null);
+  let backgroundJobProgress = $state<ThumbnailJobProgress | null>(null);
 
   const progressPercent = $derived.by(() => {
     if (!progress || progress.total_files === 0) {
@@ -199,8 +214,8 @@
     recentFiles = await invoke<FileRecord[]>("list_recent_files", { limit: 25 });
   }
 
-  async function loadContainerThumbnails(containerId: number) {
-    if (containerThumbs[containerId]) {
+  async function loadContainerThumbnails(containerId: number, force = false) {
+    if (containerThumbs[containerId] && !force) {
       return;
     }
 
@@ -218,11 +233,11 @@
     }
   }
 
-  async function loadRecentContainers() {
+  async function loadRecentContainers(forceThumbReload = false) {
     recentContainers = await invoke<ContainerRecord[]>("list_recent_containers", { limit: 25 });
 
     const ids = recentContainers.map((container) => container.id);
-    await Promise.all(ids.map((id) => loadContainerThumbnails(id)));
+    await Promise.all(ids.map((id) => loadContainerThumbnails(id, forceThumbReload)));
   }
 
   async function toggleContainerChildren(containerId: number) {
@@ -517,7 +532,13 @@
 
     try {
       lastResult = await invoke<RegisterResult>("register_folder", { folderPath });
-      statusMessage = lastResult.canceled ? "Registration canceled." : "Registration finished.";
+      if (lastResult.canceled) {
+        statusMessage = "Registration canceled.";
+      } else if (lastResult.background_job_id !== null && lastResult.queued_thumbnail_tasks > 0) {
+        statusMessage = `Registration finished. Queued ${lastResult.queued_thumbnail_tasks} background thumbnail task(s).`;
+      } else {
+        statusMessage = "Registration finished.";
+      }
       await loadRecentFiles();
       await loadRecentContainers();
     } catch (error) {
@@ -547,7 +568,8 @@
   }
 
   onMount(() => {
-    let unlisten: null | (() => void) = null;
+    let unlistenRegister: null | (() => void) = null;
+    let unlistenThumbnailJob: null | (() => void) = null;
 
     void listen<RegisterProgress>("register-progress", (event) => {
       const payload = event.payload;
@@ -616,12 +638,41 @@
         currentFileEtaSeconds = 0;
       }
     }).then((fn) => {
-      unlisten = fn;
+      unlistenRegister = fn;
+    });
+
+    void listen<ThumbnailJobProgress>("thumbnail-job-progress", (event) => {
+      const payload = event.payload;
+      if (payload.folder_path !== folderPath) {
+        return;
+      }
+      const activeJobId = lastResult?.background_job_id ?? null;
+      if (activeJobId !== null && payload.job_id !== activeJobId) {
+        return;
+      }
+
+      backgroundJobProgress = payload;
+
+      if (payload.done) {
+        statusMessage = `Thumbnail background job finished: ${payload.succeeded_tasks}/${payload.total_tasks} succeeded, ${payload.failed_tasks} failed.`;
+        if (payload.last_error) {
+          statusMessage = `${statusMessage} Last error: ${payload.last_error}`;
+        }
+        void loadRecentFiles();
+        void loadRecentContainers(true);
+      } else {
+        statusMessage = `Generating thumbnails in background... ${payload.completed_tasks}/${payload.total_tasks}`;
+      }
+    }).then((fn) => {
+      unlistenThumbnailJob = fn;
     });
 
     return () => {
-      if (unlisten) {
-        unlisten();
+      if (unlistenRegister) {
+        unlistenRegister();
+      }
+      if (unlistenThumbnailJob) {
+        unlistenThumbnailJob();
       }
     };
   });
@@ -857,8 +908,22 @@
         <p>Containers updated: <strong>{lastResult.updated_containers}</strong></p>
         <p>Group containers created: <strong>{lastResult.created_group_containers}</strong></p>
         <p>Group containers updated: <strong>{lastResult.updated_group_containers}</strong></p>
+        <p>Thumbnails queued: <strong>{lastResult.queued_thumbnail_tasks}</strong></p>
         <p>Thumbnails created: <strong>{lastResult.created_thumbnails}</strong></p>
         <p>Thumbnails updated: <strong>{lastResult.updated_thumbnails}</strong></p>
+      </div>
+    {/if}
+
+    {#if backgroundJobProgress}
+      <div class="result-grid">
+        <p>Thumbnail job ID: <strong>{backgroundJobProgress.job_id}</strong></p>
+        <p>Total tasks: <strong>{backgroundJobProgress.total_tasks}</strong></p>
+        <p>Completed: <strong>{backgroundJobProgress.completed_tasks}</strong></p>
+        <p>Succeeded: <strong>{backgroundJobProgress.succeeded_tasks}</strong></p>
+        <p>Failed: <strong>{backgroundJobProgress.failed_tasks}</strong></p>
+        <p>Current item: <strong>{backgroundJobProgress.current_item ?? "-"}</strong></p>
+        <p>Done: <strong>{backgroundJobProgress.done ? "yes" : "no"}</strong></p>
+        <p>Last error: <strong>{backgroundJobProgress.last_error ?? "-"}</strong></p>
       </div>
     {/if}
 
