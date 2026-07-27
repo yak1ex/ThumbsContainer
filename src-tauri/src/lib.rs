@@ -555,26 +555,25 @@ fn generate_archive_thumbnail_set(
         _ => return Ok((Vec::new(), Some("archive extraction failed".to_string()))),
     }
 
-    let mut image_candidates: Vec<PathBuf> = Vec::new();
-    for entry in WalkDir::new(&extract_dir).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let ext = entry
-            .path()
-            .extension()
-            .and_then(|v| v.to_str())
-            .unwrap_or_default()
-            .to_lowercase();
-        if is_image_extension(&ext) {
-            image_candidates.push(entry.path().to_path_buf());
-        }
+    let scan = scan_archive_extracted_images(&extract_dir)?;
+    let mut image_candidates = scan.image_candidates;
+    if image_candidates.is_empty() {
+        let sampled = if scan.sampled_extensions.is_empty() {
+            "none".to_string()
+        } else {
+            scan.sampled_extensions.join(", ")
+        };
+        return Ok((
+            Vec::new(),
+            Some(format!(
+                "no image files found in archive (extracted files: {}, sampled extensions: {})",
+                scan.extracted_file_count, sampled
+            )),
+        ));
     }
 
+    let total_candidates = image_candidates.len();
     image_candidates.sort();
-    if image_candidates.is_empty() {
-        return Ok((Vec::new(), Some("no image files found in archive".to_string())));
-    }
 
     let mut generated = Vec::new();
     for (slot, image_path) in image_candidates.into_iter().take(slots as usize).enumerate() {
@@ -607,11 +606,67 @@ fn generate_archive_thumbnail_set(
     if generated.is_empty() {
         return Ok((
             generated,
-            Some("failed to generate thumbnails from extracted images".to_string()),
+            Some(format!(
+                "failed to generate thumbnails from extracted images (candidates: {total_candidates})"
+            )),
         ));
     }
 
     Ok((generated, None))
+}
+
+struct ArchiveImageScanResult {
+    image_candidates: Vec<PathBuf>,
+    extracted_file_count: usize,
+    sampled_extensions: Vec<String>,
+}
+
+fn normalize_extension_from_path(path: &Path) -> String {
+    path.extension()
+        .and_then(|v| v.to_str())
+        .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn is_archive_image_extension(ext: &str) -> bool {
+    is_image_extension(ext)
+        || matches!(
+            ext,
+            "jpe" | "jfif" | "bmp" | "dib" | "tif" | "tiff" | "heic" | "heif"
+        )
+}
+
+fn scan_archive_extracted_images(extract_dir: &Path) -> Result<ArchiveImageScanResult, String> {
+    let mut image_candidates: Vec<PathBuf> = Vec::new();
+    let mut extracted_file_count = 0usize;
+    let mut sampled_extensions: Vec<String> = Vec::new();
+
+    for entry in WalkDir::new(&extract_dir).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        extracted_file_count += 1;
+
+        let ext = normalize_extension_from_path(entry.path());
+        let sample = if ext.is_empty() {
+            "(no_ext)".to_string()
+        } else {
+            ext.clone()
+        };
+        if sampled_extensions.len() < 8 && !sampled_extensions.iter().any(|v| v == &sample) {
+            sampled_extensions.push(sample);
+        }
+
+        if is_archive_image_extension(&ext) {
+            image_candidates.push(entry.path().to_path_buf());
+        }
+    }
+
+    Ok(ArchiveImageScanResult {
+        image_candidates,
+        extracted_file_count,
+        sampled_extensions,
+    })
 }
 
 fn generate_thumbnail_for_file(
@@ -2092,4 +2147,61 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_extension_from_path, scan_archive_extracted_images};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn create_file(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("failed to create parent directory for test file");
+        }
+        fs::write(path, b"x").expect("failed to create test file");
+    }
+
+    #[test]
+    fn scan_archive_images_detects_nested_variants() {
+        let base = std::env::temp_dir().join(format!(
+            "thumbscontainer_test_nested_{}",
+            std::process::id()
+        ));
+        if base.exists() {
+            let _ = fs::remove_dir_all(&base);
+        }
+        fs::create_dir_all(&base).expect("failed to create test temp dir");
+
+        let img_a = base.join("folder/subfolder1/image_a.JPG");
+        let img_b = base.join("folder/subfolder2/image_b.jPeG");
+        let img_c = base.join("folder/subfolder3/image_c.jfif");
+        let txt = base.join("folder/readme.txt");
+        let no_ext = base.join("folder/subfolder4/cover");
+
+        create_file(&img_a);
+        create_file(&img_b);
+        create_file(&img_c);
+        create_file(&txt);
+        create_file(&no_ext);
+
+        let scan = scan_archive_extracted_images(&base).expect("scan should succeed");
+
+        assert_eq!(scan.extracted_file_count, 5);
+        assert_eq!(scan.image_candidates.len(), 3);
+
+        let mut found: Vec<PathBuf> = scan.image_candidates;
+        found.sort();
+        assert!(found.contains(&img_a));
+        assert!(found.contains(&img_b));
+        assert!(found.contains(&img_c));
+
+        fs::remove_dir_all(&base).expect("failed to clean up test temp dir");
+    }
+
+    #[test]
+    fn normalize_extension_trims_and_lowercases() {
+        let path = Path::new("C:/tmp/FILE.JpEg ");
+        assert_eq!(normalize_extension_from_path(path), "jpeg");
+    }
 }

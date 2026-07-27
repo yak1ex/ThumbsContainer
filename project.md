@@ -217,8 +217,11 @@ This section summarizes the current development state and the mainline implement
 ### 17. Archive image candidate detection robustness
 
 * Goal: reduce false "no image files found in archive" outcomes when archives contain nested image files.
-* Planned:
-  * Add richer diagnostics for no-image outcomes (for example: extracted file count and sampled extensions) to distinguish true no-image archives from detection gaps.
-  * Review image candidate matching for edge cases in archive contents (extension variants, naming quirks, nested structures).
-  * Add at least one regression test case for nested archive image structures that previously reported no images.
-* Status: pending.
+* Implemented:
+  * Added richer no-image diagnostics including extracted file count and sampled extension list in archive backfill skip reasons.
+  * Expanded archive image extension matching to include additional variants (`jpe`, `jfif`, `bmp`, `dib`, `tif`, `tiff`, `heic`, `heif`) and normalized extension handling.
+  * Added backend regression tests for nested directory image detection and extension normalization.
+* Status: completed.
+* Notes:
+  * Executable verification confirmed previously failing archive source path now generates previews (example: generated 16 slots / updated 16 slots).
+  * Container ID may differ across runs while source path remains the same; verification is based on source path behavior and preview outcome.
