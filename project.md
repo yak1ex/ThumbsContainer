@@ -234,3 +234,42 @@ This section summarizes the current development state and the mainline implement
 * Notes:
   * Executable verification confirmed previously failing archive source path now generates previews (example: generated 16 slots / updated 16 slots).
   * Container ID may differ across runs while source path remains the same; verification is based on source path behavior and preview outcome.
+
+### 18. Container creation datetime metadata and datetime search
+
+* Goal: support datetime-based organization and filtering for files and containers.
+* Planned:
+  * Persist file creation datetime metadata at registration time.
+  * Define creation datetime for `image_folder` containers (initial candidate: latest creation datetime among contained files).
+  * Add datetime search criteria for files and containers: after, before, and between.
+  * Clarify timezone and source-of-truth policy for creation datetime values across platforms.
+* Status: pending.
+
+### 19. Preview support for archives containing video files
+
+* Goal: provide meaningful previews when archive contents are videos instead of images.
+* Planned:
+  * Extend archive preview generation to detect video files extracted from archives.
+  * Generate representative preview slots from extracted videos using interval sampling.
+  * Define fallback priority when both images and videos exist in one archive.
+  * Coordinate with Task 12 archive traversal policy for nested structures and extraction depth decisions.
+* Status: pending.
+
+### 20. Archive-derived virtual container hierarchy
+
+* Goal: represent archive-internal structure and themes as persistent, searchable container hierarchies.
+* Planned:
+  * Build archive-internal virtual containers during registration from both path hierarchy and media type classification (image/video).
+  * Persist virtual containers and parent/child links in DB as first-class containers.
+  * Apply recursive single-child compression always (non-configurable).
+  * Expand nested archives recursively with a consistent max-depth safety limit aligned with Task 12 policy.
+  * Use full relative path (inside the archive) as virtual container display identity.
+  * Include virtual containers as first-class search targets and provide configurable inclusion in search behavior.
+  * Preview policy:
+    * Leaf virtual containers: sampling-based previews (videos: interval sampling; image leaves: representative sampling).
+    * Non-leaf virtual containers: aggregate first N child previews.
+    * If child count M is less than slot count N, distribute slots across children as evenly as possible and fill all N slots.
+* Status: pending.
+* Notes:
+  * Initial implementation can assume DB rebuild-from-scratch during registration path migration.
+  * Explicit per-archive rebuild/edit/merge/split controls are out of scope for this phase.
