@@ -6,13 +6,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
 use walkdir::WalkDir;
 
 const REGISTER_CANCELLED: &str = "register_cancelled";
-const THUMBNAIL_JOB_PROGRESS_EVENT: &str = "thumbnail-job-progress";
 const ARCHIVE_VIRTUAL_MAX_NESTED_DEPTH: usize = 2;
 
 #[derive(Serialize)]
@@ -30,68 +29,6 @@ struct RegisterResult {
     queued_thumbnail_tasks: usize,
     background_job_id: Option<u64>,
     canceled: bool,
-}
-
-#[derive(Serialize, Clone)]
-struct ThumbnailJobProgress {
-    job_id: u64,
-    folder_path: String,
-    total_tasks: usize,
-    completed_tasks: usize,
-    succeeded_tasks: usize,
-    failed_tasks: usize,
-    current_item: Option<String>,
-    last_error: Option<String>,
-    done: bool,
-}
-
-#[derive(Clone)]
-enum ThumbnailTaskKind {
-    Image,
-    Video,
-    Archive,
-}
-
-#[derive(Clone)]
-struct ThumbnailFileTask {
-    file_id: i64,
-    container_id: i64,
-    file_path: String,
-    file_hash: String,
-    file_size: i64,
-    kind: ThumbnailTaskKind,
-}
-
-#[derive(Clone)]
-enum BackgroundThumbnailTask {
-    Generate(ThumbnailFileTask),
-    RebuildGroups {
-        folder_path: String,
-        max_slots: i64,
-    },
-}
-
-struct ThumbnailJob {
-    id: u64,
-    folder_path: String,
-    tasks: Vec<BackgroundThumbnailTask>,
-}
-
-#[derive(Default)]
-struct ThumbnailJobQueueInner {
-    jobs: Mutex<VecDeque<ThumbnailJob>>,
-    worker_running: AtomicBool,
-    next_job_id: AtomicU64,
-}
-
-#[derive(Clone, Default)]
-struct ThumbnailJobQueue {
-    inner: Arc<ThumbnailJobQueueInner>,
-}
-
-struct RegisterBlockingOutcome {
-    result: RegisterResult,
-    thumbnail_tasks: Vec<BackgroundThumbnailTask>,
 }
 
 #[derive(Serialize)]
