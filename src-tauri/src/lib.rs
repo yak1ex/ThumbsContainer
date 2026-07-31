@@ -5,7 +5,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 
 const REGISTER_CANCELLED: &str = "register_cancelled";
 const THUMBNAIL_JOB_PROGRESS_EVENT: &str = "thumbnail-job-progress";
-const DEFAULT_BG_FAIL_MARKER: &str = "__fail_bg__";
+const ARCHIVE_VIRTUAL_MAX_NESTED_DEPTH: usize = 2;
 
 #[derive(Serialize)]
 struct RegisterResult {
@@ -168,6 +168,40 @@ struct GroupRebuildResult {
     updated: usize,
 }
 
+#[derive(Clone)]
+struct ArchiveVirtualMediaEntry {
+    relative_path: String,
+    media_kind: &'static str,
+    source_path: PathBuf,
+}
+
+#[derive(Default)]
+struct ArchiveVirtualTreeNode {
+    name: String,
+    children: Vec<ArchiveVirtualTreeNode>,
+    has_image_files: bool,
+    has_video_files: bool,
+}
+
+impl ArchiveVirtualTreeNode {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            children: Vec::new(),
+            has_image_files: false,
+            has_video_files: false,
+        }
+    }
+}
+
+struct ArchiveVirtualPersistNode {
+    virtual_path: String,
+    parent_virtual_path: Option<String>,
+    node_kind: &'static str,
+    media_kind: Option<&'static str>,
+    depth: i64,
+}
+
 #[derive(Serialize, Clone)]
 struct RegisterProgress {
     folder_path: String,
@@ -309,7 +343,140 @@ fn init_database(app: tauri::AppHandle) -> Result<String, String> {
     )
     .map_err(|e| format!("failed to create schema: {e}"))?;
 
+    ensure_archive_virtual_container_meta_schema(&conn)?;
+
     Ok("database ready".to_string())
+}
+
+fn ensure_archive_virtual_container_meta_schema(conn: &Connection) -> Result<(), String> {
+    // Check existing columns before CREATE TABLE IF NOT EXISTS so we can detect
+    // a legacy table whose PRIMARY KEY column name differs from the current schema.
+    let mut pre_stmt = conn
+        .prepare("PRAGMA table_info(archive_virtual_container_meta)")
+        .map_err(|e| format!("failed to inspect archive virtual metadata table: {e}"))?;
+    let pre_rows = pre_stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| format!("failed to read archive virtual metadata columns: {e}"))?;
+    let mut pre_columns: HashSet<String> = HashSet::new();
+    for row in pre_rows {
+        pre_columns.insert(
+            row.map_err(|e| format!("failed to map archive virtual metadata column: {e}"))?,
+        );
+    }
+
+    // Legacy table exists but uses a different primary key — drop and recreate.
+    if !pre_columns.is_empty() && !pre_columns.contains("virtual_container_id") {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS archive_virtual_container_meta;",
+        )
+        .map_err(|e| format!("failed to drop legacy archive virtual metadata table: {e}"))?;
+        pre_columns.clear();
+    }
+
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS archive_virtual_container_meta (
+            virtual_container_id INTEGER PRIMARY KEY,
+            archive_container_id INTEGER NOT NULL,
+            parent_virtual_container_id INTEGER,
+            virtual_path TEXT NOT NULL,
+            node_kind TEXT NOT NULL,
+            media_kind TEXT,
+            depth INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (virtual_container_id) REFERENCES containers(id) ON DELETE CASCADE,
+            FOREIGN KEY (archive_container_id) REFERENCES containers(id) ON DELETE CASCADE,
+            FOREIGN KEY (parent_virtual_container_id) REFERENCES containers(id) ON DELETE CASCADE
+        );
+        ",
+    )
+    .map_err(|e| format!("failed to create archive virtual metadata table: {e}"))?;
+
+    let columns = pre_columns;
+
+    if !columns.contains("archive_container_id") {
+        conn.execute(
+            "ALTER TABLE archive_virtual_container_meta ADD COLUMN archive_container_id INTEGER",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "failed to add archive_container_id to archive virtual metadata table: {e}"
+            )
+        })?;
+    }
+    if !columns.contains("virtual_path") {
+        conn.execute(
+            "ALTER TABLE archive_virtual_container_meta ADD COLUMN virtual_path TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "failed to add virtual_path to archive virtual metadata table: {e}"
+            )
+        })?;
+    }
+    if !columns.contains("parent_virtual_container_id") {
+        conn.execute(
+            "ALTER TABLE archive_virtual_container_meta ADD COLUMN parent_virtual_container_id INTEGER",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "failed to add parent_virtual_container_id to archive virtual metadata table: {e}"
+            )
+        })?;
+    }
+    if !columns.contains("node_kind") {
+        conn.execute(
+            "ALTER TABLE archive_virtual_container_meta ADD COLUMN node_kind TEXT NOT NULL DEFAULT 'path'",
+            [],
+        )
+        .map_err(|e| format!("failed to add node_kind to archive virtual metadata table: {e}"))?;
+    }
+    if !columns.contains("media_kind") {
+        conn.execute(
+            "ALTER TABLE archive_virtual_container_meta ADD COLUMN media_kind TEXT",
+            [],
+        )
+        .map_err(|e| format!("failed to add media_kind to archive virtual metadata table: {e}"))?;
+    }
+    if !columns.contains("depth") {
+        conn.execute(
+            "ALTER TABLE archive_virtual_container_meta ADD COLUMN depth INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| format!("failed to add depth to archive virtual metadata table: {e}"))?;
+    }
+    if !columns.contains("created_at") {
+        conn.execute(
+            "ALTER TABLE archive_virtual_container_meta ADD COLUMN created_at TEXT NOT NULL DEFAULT (datetime('now'))",
+            [],
+        )
+        .map_err(|e| format!("failed to add created_at to archive virtual metadata table: {e}"))?;
+    }
+    if !columns.contains("updated_at") {
+        conn.execute(
+            "ALTER TABLE archive_virtual_container_meta ADD COLUMN updated_at TEXT NOT NULL DEFAULT (datetime('now'))",
+            [],
+        )
+        .map_err(|e| format!("failed to add updated_at to archive virtual metadata table: {e}"))?;
+    }
+
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_archive_virtual_meta_archive_id
+            ON archive_virtual_container_meta(archive_container_id);
+        CREATE INDEX IF NOT EXISTS idx_archive_virtual_meta_parent_id
+            ON archive_virtual_container_meta(parent_virtual_container_id);
+        CREATE INDEX IF NOT EXISTS idx_archive_virtual_meta_virtual_path
+            ON archive_virtual_container_meta(virtual_path);
+        ",
+    )
+    .map_err(|e| format!("failed to create archive virtual metadata indexes: {e}"))?;
+
+    Ok(())
 }
 
 fn detect_container_type(filename: &str) -> String {
@@ -702,6 +869,14 @@ fn is_archive_image_extension(ext: &str) -> bool {
         )
 }
 
+fn is_archive_video_extension(ext: &str) -> bool {
+    matches!(ext, "mp4" | "mkv" | "avi" | "mov" | "webm" | "m4v")
+}
+
+fn is_archive_container_extension(ext: &str) -> bool {
+    matches!(ext, "rar" | "7z" | "zip" | "lzh" | "cbz" | "cbr" | "cb7")
+}
+
 fn scan_archive_extracted_images(extract_dir: &Path) -> Result<ArchiveImageScanResult, String> {
     let mut image_candidates: Vec<PathBuf> = Vec::new();
     let mut extracted_file_count = 0usize;
@@ -733,6 +908,840 @@ fn scan_archive_extracted_images(extract_dir: &Path) -> Result<ArchiveImageScanR
         extracted_file_count,
         sampled_extensions,
     })
+}
+
+fn normalize_archive_relative_path(path: &Path) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for component in path.components() {
+        if let Component::Normal(segment) = component {
+            let value = segment.to_string_lossy().trim().to_string();
+            if !value.is_empty() {
+                parts.push(value);
+            }
+        }
+    }
+    parts.join("/")
+}
+
+struct NestedArchiveCandidate {
+    archive_file_path: PathBuf,
+    archive_logical_path: String,
+}
+
+fn collect_media_and_nested_archives_in_dir(
+    scan_root: &Path,
+    logical_prefix: Option<&str>,
+) -> (Vec<ArchiveVirtualMediaEntry>, Vec<NestedArchiveCandidate>) {
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+
+    for entry in WalkDir::new(scan_root).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(relative) = entry.path().strip_prefix(scan_root) else {
+            continue;
+        };
+        let rel = normalize_archive_relative_path(relative);
+        if rel.is_empty() {
+            continue;
+        }
+        files.push((rel, entry.path().to_path_buf()));
+    }
+
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut media_entries: Vec<ArchiveVirtualMediaEntry> = Vec::new();
+    let mut nested_archives: Vec<NestedArchiveCandidate> = Vec::new();
+
+    for (relative_path, absolute_path) in files {
+        let logical_path = match logical_prefix {
+            Some(prefix) if !prefix.is_empty() => format!("{prefix}/{relative_path}"),
+            _ => relative_path,
+        };
+
+        let ext = normalize_extension_from_path(&absolute_path);
+        if is_archive_image_extension(&ext) {
+            media_entries.push(ArchiveVirtualMediaEntry {
+                relative_path: logical_path.clone(),
+                media_kind: "image",
+                source_path: absolute_path.clone(),
+            });
+        } else if is_archive_video_extension(&ext) {
+            media_entries.push(ArchiveVirtualMediaEntry {
+                relative_path: logical_path.clone(),
+                media_kind: "video",
+                source_path: absolute_path.clone(),
+            });
+        }
+
+        if is_archive_container_extension(&ext) {
+            nested_archives.push(NestedArchiveCandidate {
+                archive_file_path: absolute_path,
+                archive_logical_path: logical_path,
+            });
+        }
+    }
+
+    (media_entries, nested_archives)
+}
+
+fn collect_archive_virtual_media_entries(extractor: &str, extract_dir: &Path) -> Vec<ArchiveVirtualMediaEntry> {
+    let (mut entries, initial_nested_archives) =
+        collect_media_and_nested_archives_in_dir(extract_dir, None);
+
+    let mut queue: VecDeque<NestedArchiveCandidate> = VecDeque::from(initial_nested_archives);
+    let nested_root = extract_dir.join("__nested_archives");
+    let _ = std::fs::create_dir_all(&nested_root);
+    let mut extraction_counter: usize = 0;
+
+    while let Some(candidate) = queue.pop_front() {
+        let depth = candidate
+            .archive_logical_path
+            .split('/')
+            .filter(|segment| {
+                let ext = Path::new(segment)
+                    .extension()
+                    .and_then(|v| v.to_str())
+                    .map(|v| v.to_ascii_lowercase())
+                    .unwrap_or_default();
+                is_archive_container_extension(&ext)
+            })
+            .count();
+
+        if depth > ARCHIVE_VIRTUAL_MAX_NESTED_DEPTH {
+            continue;
+        }
+
+        let nested_extract_dir = nested_root.join(format!("d{depth}_{:06}", extraction_counter));
+        extraction_counter = extraction_counter.saturating_add(1);
+
+        if nested_extract_dir.exists() {
+            let _ = std::fs::remove_dir_all(&nested_extract_dir);
+        }
+        if let Err(err) = std::fs::create_dir_all(&nested_extract_dir) {
+            eprintln!(
+                "archive virtual nested extraction dir create failed [{}]: {}",
+                candidate.archive_logical_path, err
+            );
+            continue;
+        }
+
+        let extraction = std::process::Command::new(extractor)
+            .arg("x")
+            .arg("-y")
+            .arg(format!("-o{}", nested_extract_dir.to_string_lossy()))
+            .arg(&candidate.archive_file_path)
+            .output();
+
+        match extraction {
+            Ok(output) if output.status.success() => {
+                let (nested_media, nested_archives) = collect_media_and_nested_archives_in_dir(
+                    &nested_extract_dir,
+                    Some(&candidate.archive_logical_path),
+                );
+                entries.extend(nested_media);
+
+                if depth < ARCHIVE_VIRTUAL_MAX_NESTED_DEPTH {
+                    for nested in nested_archives {
+                        queue.push_back(nested);
+                    }
+                }
+            }
+            Ok(_) => {
+                eprintln!(
+                    "archive virtual nested extraction command failed [{}]",
+                    candidate.archive_logical_path
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "archive virtual nested extraction invocation failed [{}]: {}",
+                    candidate.archive_logical_path, err
+                );
+            }
+        }
+    }
+
+    entries.sort_by(|a, b| {
+        a.relative_path
+            .cmp(&b.relative_path)
+            .then(a.media_kind.cmp(b.media_kind))
+            .then(a.source_path.to_string_lossy().cmp(&b.source_path.to_string_lossy()))
+    });
+    entries.dedup_by(|a, b| a.relative_path == b.relative_path && a.media_kind == b.media_kind);
+    entries
+}
+
+fn tree_child_mut<'a>(node: &'a mut ArchiveVirtualTreeNode, name: &str) -> &'a mut ArchiveVirtualTreeNode {
+    if let Some(index) = node.children.iter().position(|child| child.name == name) {
+        return &mut node.children[index];
+    }
+    node.children.push(ArchiveVirtualTreeNode::new(name.to_string()));
+    let index = node.children.len().saturating_sub(1);
+    &mut node.children[index]
+}
+
+fn build_archive_virtual_tree(entries: &[ArchiveVirtualMediaEntry]) -> ArchiveVirtualTreeNode {
+    let mut root = ArchiveVirtualTreeNode::default();
+
+    for entry in entries {
+        let parts: Vec<&str> = entry
+            .relative_path
+            .split('/')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.is_empty() {
+            continue;
+        }
+
+        let mut node = &mut root;
+        if parts.len() > 1 {
+            for part in &parts[..parts.len() - 1] {
+                node = tree_child_mut(node, part);
+            }
+        }
+
+        if entry.media_kind == "image" {
+            node.has_image_files = true;
+        } else if entry.media_kind == "video" {
+            node.has_video_files = true;
+        }
+    }
+
+    root
+}
+
+fn compress_archive_virtual_tree(node: &mut ArchiveVirtualTreeNode, allow_self_compress: bool) {
+    for child in &mut node.children {
+        compress_archive_virtual_tree(child, true);
+    }
+
+    if !allow_self_compress {
+        node.children.sort_by(|a, b| a.name.cmp(&b.name));
+        return;
+    }
+
+    loop {
+        let can_compress = !node.has_image_files && !node.has_video_files && node.children.len() == 1;
+        if !can_compress {
+            break;
+        }
+
+        let child = node.children.remove(0);
+        if node.name.is_empty() {
+            node.name = child.name;
+        } else if !child.name.is_empty() {
+            node.name = format!("{}/{}", node.name, child.name);
+        }
+        node.has_image_files = child.has_image_files;
+        node.has_video_files = child.has_video_files;
+        node.children = child.children;
+    }
+
+    node.children.sort_by(|a, b| a.name.cmp(&b.name));
+}
+
+fn join_virtual_path(base: &str, child: &str) -> String {
+    if base == "." {
+        child.to_string()
+    } else {
+        format!("{base}/{child}")
+    }
+}
+
+fn collect_archive_virtual_nodes(
+    node: &ArchiveVirtualTreeNode,
+    current_path: &str,
+    parent_path: Option<&str>,
+    depth: i64,
+    out: &mut Vec<ArchiveVirtualPersistNode>,
+) {
+    out.push(ArchiveVirtualPersistNode {
+        virtual_path: current_path.to_string(),
+        parent_virtual_path: parent_path.map(|v| v.to_string()),
+        node_kind: "path",
+        media_kind: None,
+        depth,
+    });
+
+    if node.has_image_files {
+        out.push(ArchiveVirtualPersistNode {
+            virtual_path: join_virtual_path(current_path, "@image"),
+            parent_virtual_path: Some(current_path.to_string()),
+            node_kind: "media",
+            media_kind: Some("image"),
+            depth: depth + 1,
+        });
+    }
+    if node.has_video_files {
+        out.push(ArchiveVirtualPersistNode {
+            virtual_path: join_virtual_path(current_path, "@video"),
+            parent_virtual_path: Some(current_path.to_string()),
+            node_kind: "media",
+            media_kind: Some("video"),
+            depth: depth + 1,
+        });
+    }
+
+    for child in &node.children {
+        let child_path = join_virtual_path(current_path, &child.name);
+        collect_archive_virtual_nodes(child, &child_path, Some(current_path), depth + 1, out);
+    }
+}
+
+fn virtual_container_slot_thumbnail_cache_path(
+    app: &tauri::AppHandle,
+    file_hash: &str,
+    size: i64,
+    virtual_path: &str,
+    slot_index: i64,
+) -> Result<PathBuf, String> {
+    let thumb_dir = thumbnail_cache_dir(app)?;
+    let mut hasher = Sha256::new();
+    hasher.update(virtual_path.as_bytes());
+    let virtual_key = hex::encode(hasher.finalize());
+    Ok(thumb_dir.join(format!(
+        "{file_hash}_{size}_v_{virtual_key}_{slot_index}.png"
+    )))
+}
+
+fn pick_even_index(total: usize, position: usize, slots: usize) -> usize {
+    if total == 0 || slots == 0 {
+        return 0;
+    }
+    (position.saturating_mul(total)) / slots
+}
+
+fn path_parent_virtual_path(path: &str) -> String {
+    if path == "." {
+        return ".".to_string();
+    }
+    let p = Path::new(path);
+    let Some(parent) = p.parent() else {
+        return ".".to_string();
+    };
+    let normalized = normalize_archive_relative_path(parent);
+    if normalized.is_empty() {
+        ".".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn resolve_media_parent_path(parent: &str, path_nodes: &[String]) -> String {
+    let mut best = ".".to_string();
+    let mut best_len = 0usize;
+
+    for candidate in path_nodes {
+        let matches = if candidate == "." {
+            true
+        } else {
+            parent == candidate || parent.starts_with(&format!("{candidate}/"))
+        };
+
+        if matches && candidate.len() >= best_len {
+            best = candidate.clone();
+            best_len = candidate.len();
+        }
+    }
+
+    best
+}
+
+fn generate_image_virtual_slot(
+    app: &tauri::AppHandle,
+    source_path: &Path,
+    file_hash: &str,
+    size: i64,
+    virtual_path: &str,
+    slot_index: i64,
+) -> Result<Option<String>, String> {
+    let output_path = virtual_container_slot_thumbnail_cache_path(
+        app,
+        file_hash,
+        size,
+        virtual_path,
+        slot_index,
+    )?;
+
+    if output_path.exists() {
+        return Ok(Some(output_path.to_string_lossy().to_string()));
+    }
+
+    let output = std::process::Command::new("ffmpeg.exe")
+        .arg("-y")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-i")
+        .arg(source_path)
+        .arg("-vf")
+        .arg("scale=320:-1:flags=lanczos")
+        .arg("-frames:v")
+        .arg("1")
+        .arg(&output_path)
+        .output()
+        .map_err(|e| format!("failed to run ffmpeg for virtual image thumbnail: {e}"))?;
+
+    if output.status.success() && output_path.exists() {
+        return Ok(Some(output_path.to_string_lossy().to_string()));
+    }
+
+    if output_path.exists() {
+        let _ = std::fs::remove_file(&output_path);
+    }
+    Ok(None)
+}
+
+fn generate_video_virtual_slot(
+    app: &tauri::AppHandle,
+    source_path: &Path,
+    file_hash: &str,
+    size: i64,
+    virtual_path: &str,
+    slot_index: i64,
+    slot_position_in_video: usize,
+    slots_for_video: usize,
+) -> Result<Option<String>, String> {
+    let output_path = virtual_container_slot_thumbnail_cache_path(
+        app,
+        file_hash,
+        size,
+        virtual_path,
+        slot_index,
+    )?;
+
+    if output_path.exists() {
+        return Ok(Some(output_path.to_string_lossy().to_string()));
+    }
+
+    let source_text = source_path.to_string_lossy().to_string();
+    let duration = probe_video_duration_seconds(&source_text).unwrap_or(0.0);
+    let ts = if duration > 0.0 && slots_for_video > 0 {
+        ((slot_position_in_video as f64 + 0.5) / slots_for_video as f64) * duration
+    } else {
+        1.0 + slot_position_in_video as f64
+    };
+
+    let output = std::process::Command::new("ffmpeg.exe")
+        .arg("-y")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-ss")
+        .arg(format!("{ts:.3}"))
+        .arg("-i")
+        .arg(source_path)
+        .arg("-vf")
+        .arg("scale=320:-1:flags=lanczos")
+        .arg("-frames:v")
+        .arg("1")
+        .arg(&output_path)
+        .output()
+        .map_err(|e| format!("failed to run ffmpeg for virtual video thumbnail: {e}"))?;
+
+    if output.status.success() && output_path.exists() {
+        return Ok(Some(output_path.to_string_lossy().to_string()));
+    }
+
+    if output_path.exists() {
+        let _ = std::fs::remove_file(&output_path);
+    }
+    Ok(None)
+}
+
+fn persist_container_thumbnail_slots(
+    conn: &Connection,
+    container_id: i64,
+    slot_paths: &[String],
+) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM container_thumbnails WHERE container_id = ?",
+        [container_id],
+    )
+    .map_err(|e| format!("failed to clear virtual container thumbnails for {container_id}: {e}"))?;
+
+    for (idx, path) in slot_paths.iter().enumerate() {
+        let slot = idx as i64;
+        let _ = upsert_container_thumbnail(conn, container_id, slot, path)?;
+    }
+
+    Ok(())
+}
+
+fn build_non_leaf_aggregate_slots(
+    child_slot_sets: &[Vec<String>],
+    max_slots: usize,
+) -> Vec<String> {
+    let active_children: Vec<&Vec<String>> = child_slot_sets
+        .iter()
+        .filter(|slots| !slots.is_empty())
+        .collect();
+    let child_count = active_children.len();
+
+    if child_count == 0 || max_slots == 0 {
+        return Vec::new();
+    }
+
+    if child_count >= max_slots {
+        return active_children
+            .iter()
+            .take(max_slots)
+            .map(|slots| slots[0].clone())
+            .collect();
+    }
+
+    let mut counts = vec![max_slots / child_count; child_count];
+    for count in counts.iter_mut().take(max_slots % child_count) {
+        *count += 1;
+    }
+
+    let mut cursors = vec![0usize; child_count];
+    let mut output: Vec<String> = Vec::with_capacity(max_slots);
+
+    while output.len() < max_slots {
+        let mut progressed = false;
+        for i in 0..child_count {
+            if counts[i] == 0 {
+                continue;
+            }
+            let source = active_children[i];
+            let value = source[cursors[i] % source.len()].clone();
+            output.push(value);
+            counts[i] -= 1;
+            cursors[i] += 1;
+            progressed = true;
+            if output.len() >= max_slots {
+                break;
+            }
+        }
+
+        if !progressed {
+            break;
+        }
+    }
+
+    output
+}
+
+fn rebuild_archive_virtual_container_thumbnails(
+    app: &tauri::AppHandle,
+    conn: &Connection,
+    archive_file_hash: &str,
+    archive_file_size: i64,
+    nodes: &[ArchiveVirtualPersistNode],
+    entries: &[ArchiveVirtualMediaEntry],
+    id_by_virtual_path: &HashMap<String, i64>,
+    max_slots: usize,
+) -> Result<(), String> {
+    if max_slots == 0 {
+        return Ok(());
+    }
+
+    let path_nodes: Vec<String> = nodes
+        .iter()
+        .filter(|node| node.node_kind == "path")
+        .map(|node| node.virtual_path.clone())
+        .collect();
+    let media_nodes: HashSet<String> = nodes
+        .iter()
+        .filter(|node| node.node_kind == "media")
+        .map(|node| node.virtual_path.clone())
+        .collect();
+
+    let mut media_entries_by_node: HashMap<String, Vec<&ArchiveVirtualMediaEntry>> = HashMap::new();
+    for entry in entries {
+        let parent = path_parent_virtual_path(&entry.relative_path);
+        let resolved_parent = resolve_media_parent_path(&parent, &path_nodes);
+        let media_path = join_virtual_path(&resolved_parent, if entry.media_kind == "video" { "@video" } else { "@image" });
+        if media_nodes.contains(&media_path) {
+            media_entries_by_node.entry(media_path).or_default().push(entry);
+        }
+    }
+
+    let mut slot_paths_by_virtual_path: HashMap<String, Vec<String>> = HashMap::new();
+
+    for node in nodes.iter().filter(|node| node.node_kind == "media") {
+        let Some(container_id) = id_by_virtual_path.get(&node.virtual_path).copied() else {
+            continue;
+        };
+
+        let mut group_entries: Vec<&ArchiveVirtualMediaEntry> = media_entries_by_node
+            .get(&node.virtual_path)
+            .cloned()
+            .unwrap_or_default();
+        group_entries.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+
+        let mut generated_paths: Vec<String> = Vec::new();
+        if node.media_kind == Some("image") {
+            if !group_entries.is_empty() {
+                for slot in 0..max_slots {
+                    let idx = pick_even_index(group_entries.len(), slot, max_slots).min(group_entries.len() - 1);
+                    if let Some(path) = generate_image_virtual_slot(
+                        app,
+                        &group_entries[idx].source_path,
+                        archive_file_hash,
+                        archive_file_size,
+                        &node.virtual_path,
+                        slot as i64,
+                    )? {
+                        generated_paths.push(path);
+                    }
+                }
+            }
+        } else if node.media_kind == Some("video") {
+            if !group_entries.is_empty() {
+                let mut slots_per_video = vec![0usize; group_entries.len()];
+                let mut slot_video_index: Vec<usize> = Vec::with_capacity(max_slots);
+                for slot in 0..max_slots {
+                    let idx = pick_even_index(group_entries.len(), slot, max_slots).min(group_entries.len() - 1);
+                    slot_video_index.push(idx);
+                    slots_per_video[idx] += 1;
+                }
+
+                let mut used_per_video = vec![0usize; group_entries.len()];
+                for (slot, video_idx) in slot_video_index.into_iter().enumerate() {
+                    let position = used_per_video[video_idx];
+                    used_per_video[video_idx] = used_per_video[video_idx].saturating_add(1);
+                    if let Some(path) = generate_video_virtual_slot(
+                        app,
+                        &group_entries[video_idx].source_path,
+                        archive_file_hash,
+                        archive_file_size,
+                        &node.virtual_path,
+                        slot as i64,
+                        position,
+                        slots_per_video[video_idx].max(1),
+                    )? {
+                        generated_paths.push(path);
+                    }
+                }
+            }
+        }
+
+        persist_container_thumbnail_slots(conn, container_id, &generated_paths)?;
+        slot_paths_by_virtual_path.insert(node.virtual_path.clone(), generated_paths);
+    }
+
+    let mut children_by_parent: HashMap<String, Vec<String>> = HashMap::new();
+    for node in nodes {
+        if let Some(parent) = &node.parent_virtual_path {
+            children_by_parent
+                .entry(parent.clone())
+                .or_default()
+                .push(node.virtual_path.clone());
+        }
+    }
+    for children in children_by_parent.values_mut() {
+        children.sort();
+    }
+
+    let mut path_nodes_desc: Vec<&ArchiveVirtualPersistNode> = nodes
+        .iter()
+        .filter(|node| node.node_kind == "path")
+        .collect();
+    path_nodes_desc.sort_by(|a, b| b.depth.cmp(&a.depth).then(a.virtual_path.cmp(&b.virtual_path)));
+
+    for node in path_nodes_desc {
+        let Some(container_id) = id_by_virtual_path.get(&node.virtual_path).copied() else {
+            continue;
+        };
+
+        let child_paths = children_by_parent
+            .get(&node.virtual_path)
+            .cloned()
+            .unwrap_or_default();
+        let child_slot_sets: Vec<Vec<String>> = child_paths
+            .iter()
+            .map(|child| slot_paths_by_virtual_path.get(child).cloned().unwrap_or_default())
+            .collect();
+
+        let aggregated = build_non_leaf_aggregate_slots(&child_slot_sets, max_slots);
+        persist_container_thumbnail_slots(conn, container_id, &aggregated)?;
+        slot_paths_by_virtual_path.insert(node.virtual_path.clone(), aggregated);
+    }
+
+    Ok(())
+}
+
+fn persist_archive_virtual_hierarchy(
+    conn: &Connection,
+    archive_container_id: i64,
+    archive_source_path: &str,
+    nodes: &[ArchiveVirtualPersistNode],
+) -> Result<HashMap<String, i64>, String> {
+    let mut existing_stmt = conn
+        .prepare(
+            "
+            SELECT virtual_container_id
+            FROM archive_virtual_container_meta
+            WHERE archive_container_id = ?
+            ",
+        )
+        .map_err(|e| format!("failed to prepare archive virtual metadata query: {e}"))?;
+
+    let existing_rows = existing_stmt
+        .query_map([archive_container_id], |row| row.get::<_, i64>(0))
+        .map_err(|e| format!("failed to query archive virtual metadata rows: {e}"))?;
+
+    let mut stale_container_ids: Vec<i64> = Vec::new();
+    for row in existing_rows {
+        stale_container_ids.push(row.map_err(|e| format!("failed to map archive virtual metadata row: {e}"))?);
+    }
+
+    for container_id in stale_container_ids {
+        conn.execute("DELETE FROM containers WHERE id = ?", [container_id])
+            .map_err(|e| format!("failed to delete stale archive virtual container {container_id}: {e}"))?;
+    }
+
+    if nodes.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut id_by_virtual_path: HashMap<String, i64> = HashMap::new();
+
+    for node in nodes {
+        let source_path = format!("{archive_source_path}::{}", node.virtual_path);
+        conn.execute(
+            "
+            INSERT INTO containers(container_type, display_name, source_path)
+            VALUES ('archive_virtual', ?, ?)
+            ",
+            params![node.virtual_path, source_path],
+        )
+        .map_err(|e| format!("failed to insert archive virtual container {}: {e}", node.virtual_path))?;
+
+        let virtual_container_id = conn.last_insert_rowid();
+        let parent_virtual_container_id = node
+            .parent_virtual_path
+            .as_ref()
+            .and_then(|path| id_by_virtual_path.get(path))
+            .copied();
+
+        conn.execute(
+            "
+            INSERT INTO archive_virtual_container_meta(
+                virtual_container_id,
+                archive_container_id,
+                parent_virtual_container_id,
+                virtual_path,
+                node_kind,
+                media_kind,
+                depth,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+            ",
+            params![
+                virtual_container_id,
+                archive_container_id,
+                parent_virtual_container_id,
+                node.virtual_path,
+                node.node_kind,
+                node.media_kind,
+                node.depth,
+            ],
+        )
+        .map_err(|e| format!("failed to insert archive virtual metadata {}: {e}", node.virtual_path))?;
+
+        if let Some(parent_id) = parent_virtual_container_id {
+            conn.execute(
+                "
+                INSERT OR IGNORE INTO container_children(parent_container_id, child_container_id)
+                VALUES (?, ?)
+                ",
+                params![parent_id, virtual_container_id],
+            )
+            .map_err(|e| format!("failed to link archive virtual parent-child: {e}"))?;
+        } else {
+            conn.execute(
+                "
+                INSERT OR IGNORE INTO container_children(parent_container_id, child_container_id)
+                VALUES (?, ?)
+                ",
+                params![archive_container_id, virtual_container_id],
+            )
+            .map_err(|e| format!("failed to link archive root virtual container: {e}"))?;
+        }
+
+        id_by_virtual_path.insert(node.virtual_path.clone(), virtual_container_id);
+    }
+
+    conn.execute(
+        "UPDATE containers SET updated_at = datetime('now') WHERE id = ?",
+        [archive_container_id],
+    )
+    .map_err(|e| format!("failed to update archive container timestamp after virtual rebuild: {e}"))?;
+
+    Ok(id_by_virtual_path)
+}
+
+fn rebuild_archive_virtual_hierarchy(
+    app: &tauri::AppHandle,
+    conn: &Connection,
+    archive_container_id: i64,
+    archive_source_path: &str,
+    file_hash: &str,
+    file_size: i64,
+) -> Result<(), String> {
+    let extractor = match find_archive_extractor() {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("failed to resolve app data dir: {e}"))?;
+    let extract_dir = app_data
+        .join("archive_extract_virtual")
+        .join(format!("{file_hash}_{file_size}"));
+
+    if extract_dir.exists() {
+        let _ = std::fs::remove_dir_all(&extract_dir);
+    }
+    std::fs::create_dir_all(&extract_dir)
+        .map_err(|e| format!("failed to create archive virtual extraction dir {:?}: {e}", extract_dir))?;
+
+    let extract_status = std::process::Command::new(extractor)
+        .arg("x")
+        .arg("-y")
+        .arg(format!("-o{}", extract_dir.to_string_lossy()))
+        .arg(archive_source_path)
+        .output();
+
+    match extract_status {
+        Ok(output) if output.status.success() => {}
+        _ => return Ok(()),
+    }
+
+    let entries = collect_archive_virtual_media_entries(extractor, &extract_dir);
+    if entries.is_empty() {
+        persist_archive_virtual_hierarchy(conn, archive_container_id, archive_source_path, &[])?;
+        return Ok(());
+    }
+
+    let mut tree = build_archive_virtual_tree(&entries);
+    for child in &mut tree.children {
+        compress_archive_virtual_tree(child, true);
+    }
+    tree.children.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut nodes: Vec<ArchiveVirtualPersistNode> = Vec::new();
+    collect_archive_virtual_nodes(&tree, ".", None, 0, &mut nodes);
+    let id_by_virtual_path =
+        persist_archive_virtual_hierarchy(conn, archive_container_id, archive_source_path, &nodes)?;
+
+    rebuild_archive_virtual_container_thumbnails(
+        app,
+        conn,
+        file_hash,
+        file_size,
+        &nodes,
+        &entries,
+        &id_by_virtual_path,
+        16,
+    )
 }
 
 fn generate_thumbnail_for_file(
@@ -1223,302 +2232,11 @@ fn emit_register_progress(app: &tauri::AppHandle, progress: &RegisterProgress) {
     let _ = app.emit("register-progress", progress.clone());
 }
 
-fn emit_thumbnail_job_progress(app: &tauri::AppHandle, progress: &ThumbnailJobProgress) {
-    let _ = app.emit(THUMBNAIL_JOB_PROGRESS_EVENT, progress.clone());
-}
-
-impl ThumbnailJobQueue {
-    fn enqueue_job(
-        &self,
-        folder_path: String,
-        tasks: Vec<BackgroundThumbnailTask>,
-    ) -> Result<Option<u64>, String> {
-        if tasks.is_empty() {
-            return Ok(None);
-        }
-
-        let id = self
-            .inner
-            .next_job_id
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-
-        let mut jobs = self
-            .inner
-            .jobs
-            .lock()
-            .map_err(|_| "failed to lock thumbnail job queue".to_string())?;
-        jobs.push_back(ThumbnailJob {
-            id,
-            folder_path,
-            tasks,
-        });
-        Ok(Some(id))
-    }
-
-    fn pop_job(&self) -> Option<ThumbnailJob> {
-        let mut jobs = self.inner.jobs.lock().ok()?;
-        jobs.pop_front()
-    }
-
-    fn ensure_worker(&self, app: tauri::AppHandle) {
-        if self
-            .inner
-            .worker_running
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
-        }
-
-        let queue = self.clone();
-        tauri::async_runtime::spawn(async move {
-            let app_handle = app.clone();
-            let queue_for_worker = queue.clone();
-            let _ = tauri::async_runtime::spawn_blocking(move || {
-                while let Some(job) = queue_for_worker.pop_job() {
-                    process_thumbnail_job(&app_handle, job);
-                }
-            })
-            .await;
-
-            queue.inner.worker_running.store(false, Ordering::SeqCst);
-
-            if let Some(job) = queue.pop_job() {
-                if let Ok(mut jobs) = queue.inner.jobs.lock() {
-                    jobs.push_front(job);
-                }
-                queue.ensure_worker(app);
-            }
-        });
-    }
-}
-
-fn enqueue_thumbnail_task(
-    tasks: &mut Vec<BackgroundThumbnailTask>,
-    file_id: i64,
-    container_id: i64,
-    path_text: &str,
-    hash: &str,
-    size_i64: i64,
-    filename: &str,
-) {
-    let kind = if let Some(v) = detect_thumbnailable_kind(filename) {
-        if v == "video" {
-            Some(ThumbnailTaskKind::Video)
-        } else {
-            Some(ThumbnailTaskKind::Image)
-        }
-    } else if detect_container_type(filename) == "archive" {
-        Some(ThumbnailTaskKind::Archive)
-    } else {
-        None
-    };
-
-    if let Some(kind) = kind {
-        tasks.push(BackgroundThumbnailTask::Generate(ThumbnailFileTask {
-            file_id,
-            container_id,
-            file_path: path_text.to_string(),
-            file_hash: hash.to_string(),
-            file_size: size_i64,
-            kind,
-        }));
-    }
-}
-
-fn background_fail_marker_for_debug() -> Option<String> {
-    if !cfg!(debug_assertions) {
-        return None;
-    }
-
-    let marker = std::env::var("THUMBS_BG_FAIL_MARKER")
-        .unwrap_or_else(|_| DEFAULT_BG_FAIL_MARKER.to_string())
-        .trim()
-        .to_string();
-
-    if marker.is_empty() {
-        None
-    } else {
-        Some(marker)
-    }
-}
-
-fn injected_background_task_error(file_path: &str) -> Option<String> {
-    let marker = background_fail_marker_for_debug()?;
-    let path_lower = file_path.to_ascii_lowercase();
-    let marker_lower = marker.to_ascii_lowercase();
-    if path_lower.contains(&marker_lower) {
-        Some(format!(
-            "injected background thumbnail failure for testing (marker: {marker})"
-        ))
-    } else {
-        None
-    }
-}
-
-fn process_thumbnail_file_task(
-    app: &tauri::AppHandle,
-    conn: &Connection,
-    task: &ThumbnailFileTask,
-) -> Result<(), String> {
-    if let Some(err) = injected_background_task_error(&task.file_path) {
-        return Err(err);
-    }
-
-    if !Path::new(&task.file_path).exists() {
-        return Err("source file does not exist".to_string());
-    }
-
-    match task.kind {
-        ThumbnailTaskKind::Video => {
-            let slots = generate_video_thumbnail_set(
-                app,
-                &task.file_path,
-                &task.file_hash,
-                task.file_size,
-                16,
-            )?;
-            if slots.is_empty() {
-                return Err("no video thumbnails generated".to_string());
-            }
-            for (slot_index, thumb_path) in &slots {
-                let _ = upsert_container_thumbnail(conn, task.container_id, *slot_index, thumb_path)?;
-            }
-            if let Some((_, primary)) = slots.first() {
-                let _ = upsert_thumbnail(conn, task.file_id, primary)?;
-            }
-        }
-        ThumbnailTaskKind::Image => {
-            if let Some(thumbnail_path) =
-                generate_thumbnail_for_file(app, &task.file_path, &task.file_hash, task.file_size, "image")?
-            {
-                let _ = upsert_thumbnail(conn, task.file_id, &thumbnail_path)?;
-                let _ = upsert_container_thumbnail(conn, task.container_id, 0, &thumbnail_path)?;
-            } else {
-                return Err("no image thumbnail generated".to_string());
-            }
-        }
-        ThumbnailTaskKind::Archive => {
-            let (slots, reason) = generate_archive_thumbnail_set(
-                app,
-                &task.file_path,
-                &task.file_hash,
-                task.file_size,
-                16,
-            )?;
-            if slots.is_empty() {
-                return Err(reason.unwrap_or_else(|| "no archive thumbnails generated".to_string()));
-            }
-            for (slot_index, thumb_path) in &slots {
-                let _ = upsert_container_thumbnail(conn, task.container_id, *slot_index, thumb_path)?;
-            }
-            if let Some((_, primary)) = slots.first() {
-                let _ = upsert_thumbnail(conn, task.file_id, primary)?;
-            }
-        }
-    }
-
-    conn.execute(
-        "UPDATE containers SET updated_at = datetime('now') WHERE id = ?",
-        [task.container_id],
-    )
-    .map_err(|e| format!("failed to update container timestamp for {}: {e}", task.container_id))?;
-
-    Ok(())
-}
-
-fn process_thumbnail_job(app: &tauri::AppHandle, job: ThumbnailJob) {
-    let total_tasks = job.tasks.len();
-    let mut completed_tasks = 0usize;
-    let mut succeeded_tasks = 0usize;
-    let mut failed_tasks = 0usize;
-    let mut last_error_message: Option<String> = None;
-
-    let conn = match open_db(app) {
-        Ok(conn) => conn,
-        Err(err) => {
-            emit_thumbnail_job_progress(
-                app,
-                &ThumbnailJobProgress {
-                    job_id: job.id,
-                    folder_path: job.folder_path,
-                    total_tasks,
-                    completed_tasks: total_tasks,
-                    succeeded_tasks: 0,
-                    failed_tasks: total_tasks,
-                    current_item: None,
-                    last_error: Some(err),
-                    done: true,
-                },
-            );
-            return;
-        }
-    };
-
-    emit_thumbnail_job_progress(
-        app,
-        &ThumbnailJobProgress {
-            job_id: job.id,
-            folder_path: job.folder_path.clone(),
-            total_tasks,
-            completed_tasks,
-            succeeded_tasks,
-            failed_tasks,
-            current_item: None,
-            last_error: None,
-            done: false,
-        },
-    );
-
-    for task in job.tasks {
-        let current_item = match &task {
-            BackgroundThumbnailTask::Generate(file_task) => Some(file_task.file_path.clone()),
-            BackgroundThumbnailTask::RebuildGroups { folder_path, .. } => {
-                Some(format!("rebuild_group_thumbnails:{folder_path}"))
-            }
-        };
-
-        let task_result = match task {
-            BackgroundThumbnailTask::Generate(file_task) => {
-                process_thumbnail_file_task(app, &conn, &file_task)
-            }
-            BackgroundThumbnailTask::RebuildGroups {
-                folder_path,
-                max_slots,
-            } => rebuild_group_container_thumbnail_slots(&conn, &folder_path, max_slots),
-        };
-
-        completed_tasks += 1;
-        if let Err(err) = task_result {
-            failed_tasks += 1;
-            last_error_message = Some(err);
-        } else {
-            succeeded_tasks += 1;
-        }
-
-        emit_thumbnail_job_progress(
-            app,
-            &ThumbnailJobProgress {
-                job_id: job.id,
-                folder_path: job.folder_path.clone(),
-                total_tasks,
-                completed_tasks,
-                succeeded_tasks,
-                failed_tasks,
-                current_item,
-                last_error: last_error_message.clone(),
-                done: completed_tasks >= total_tasks,
-            },
-        );
-    }
-}
-
 fn register_folder_blocking(
     app: &tauri::AppHandle,
     folder_path: &str,
     cancel_flag: Arc<AtomicBool>,
-) -> Result<RegisterBlockingOutcome, String> {
+) -> Result<RegisterResult, String> {
     let path = Path::new(folder_path);
     if !path.exists() || !path.is_dir() {
         return Err("folder_path does not exist or is not a directory".to_string());
@@ -1547,8 +2265,6 @@ fn register_folder_blocking(
         background_job_id: None,
         canceled: false,
     };
-
-    let mut thumbnail_tasks: Vec<BackgroundThumbnailTask> = Vec::new();
 
     emit_register_progress(
         app,
@@ -1683,15 +2399,56 @@ fn register_folder_blocking(
                 result.updated_containers += 1;
             }
 
-            enqueue_thumbnail_task(
-                &mut thumbnail_tasks,
-                moved_file_id,
-                outcome.container_id,
-                &path_text,
-                &hash,
-                size_i64,
-                &filename,
-            );
+            if let Some(kind) = detect_thumbnailable_kind(&filename) {
+                if kind == "video" {
+                    let slots = generate_video_thumbnail_set(app, &path_text, &hash, size_i64, 16)?;
+                    for (slot_index, thumb_path) in &slots {
+                        let _ = upsert_container_thumbnail(&conn, outcome.container_id, *slot_index, thumb_path)?;
+                    }
+                    if let Some((_, primary)) = slots.first() {
+                        if upsert_thumbnail(&conn, moved_file_id, primary)? {
+                            result.updated_thumbnails += 1;
+                        } else {
+                            result.created_thumbnails += 1;
+                        }
+                    }
+                } else if let Some(thumbnail_path) =
+                    generate_thumbnail_for_file(app, &path_text, &hash, size_i64, kind)?
+                {
+                    if upsert_thumbnail(&conn, moved_file_id, &thumbnail_path)? {
+                        result.updated_thumbnails += 1;
+                    } else {
+                        result.created_thumbnails += 1;
+                    }
+                    let _ = upsert_container_thumbnail(&conn, outcome.container_id, 0, &thumbnail_path)?;
+                }
+            } else if detect_container_type(&filename) == "archive" {
+                let (slots, _) = generate_archive_thumbnail_set(app, &path_text, &hash, size_i64, 16)?;
+                for (slot_index, thumb_path) in &slots {
+                    let _ = upsert_container_thumbnail(&conn, outcome.container_id, *slot_index, thumb_path)?;
+                }
+                if let Some((_, primary)) = slots.first() {
+                    if upsert_thumbnail(&conn, moved_file_id, primary)? {
+                        result.updated_thumbnails += 1;
+                    } else {
+                        result.created_thumbnails += 1;
+                    }
+                }
+
+                if let Err(err) = rebuild_archive_virtual_hierarchy(
+                    app,
+                    &conn,
+                    outcome.container_id,
+                    &path_text,
+                    &hash,
+                    size_i64,
+                ) {
+                    eprintln!(
+                        "archive virtual hierarchy rebuild failed for {}: {}",
+                        path_text, err
+                    );
+                }
+            }
 
             continue;
         }
@@ -1721,15 +2478,56 @@ fn register_folder_blocking(
                 result.updated_containers += 1;
             }
 
-            enqueue_thumbnail_task(
-                &mut thumbnail_tasks,
-                inserted_file_id,
-                outcome.container_id,
-                &path_text,
-                &hash,
-                size_i64,
-                &filename,
-            );
+            if let Some(kind) = detect_thumbnailable_kind(&filename) {
+                if kind == "video" {
+                    let slots = generate_video_thumbnail_set(app, &path_text, &hash, size_i64, 16)?;
+                    for (slot_index, thumb_path) in &slots {
+                        let _ = upsert_container_thumbnail(&conn, outcome.container_id, *slot_index, thumb_path)?;
+                    }
+                    if let Some((_, primary)) = slots.first() {
+                        if upsert_thumbnail(&conn, inserted_file_id, primary)? {
+                            result.updated_thumbnails += 1;
+                        } else {
+                            result.created_thumbnails += 1;
+                        }
+                    }
+                } else if let Some(thumbnail_path) =
+                    generate_thumbnail_for_file(app, &path_text, &hash, size_i64, kind)?
+                {
+                    if upsert_thumbnail(&conn, inserted_file_id, &thumbnail_path)? {
+                        result.updated_thumbnails += 1;
+                    } else {
+                        result.created_thumbnails += 1;
+                    }
+                    let _ = upsert_container_thumbnail(&conn, outcome.container_id, 0, &thumbnail_path)?;
+                }
+            } else if detect_container_type(&filename) == "archive" {
+                let (slots, _) = generate_archive_thumbnail_set(app, &path_text, &hash, size_i64, 16)?;
+                for (slot_index, thumb_path) in &slots {
+                    let _ = upsert_container_thumbnail(&conn, outcome.container_id, *slot_index, thumb_path)?;
+                }
+                if let Some((_, primary)) = slots.first() {
+                    if upsert_thumbnail(&conn, inserted_file_id, primary)? {
+                        result.updated_thumbnails += 1;
+                    } else {
+                        result.created_thumbnails += 1;
+                    }
+                }
+
+                if let Err(err) = rebuild_archive_virtual_hierarchy(
+                    app,
+                    &conn,
+                    outcome.container_id,
+                    &path_text,
+                    &hash,
+                    size_i64,
+                ) {
+                    eprintln!(
+                        "archive virtual hierarchy rebuild failed for {}: {}",
+                        path_text, err
+                    );
+                }
+            }
         }
 
         if result.scanned_files % 25 == 0 || result.scanned_files == total_files {
@@ -1773,18 +2571,10 @@ fn register_folder_blocking(
         let grouping = rebuild_image_group_containers(&conn, folder_path)?;
         result.created_group_containers = grouping.created;
         result.updated_group_containers = grouping.updated;
-        thumbnail_tasks.push(BackgroundThumbnailTask::RebuildGroups {
-            folder_path: folder_path.to_string(),
-            max_slots: 16,
-        });
+        rebuild_group_container_thumbnail_slots(&conn, folder_path, 16)?;
     }
 
-    result.queued_thumbnail_tasks = thumbnail_tasks.len();
-
-    Ok(RegisterBlockingOutcome {
-        result,
-        thumbnail_tasks,
-    })
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1816,6 +2606,7 @@ fn list_recent_containers(
                             FROM container_thumbnails
                             GROUP BY container_id
                         ) AS thumb_counts ON thumb_counts.container_id = c.id
+                        WHERE c.container_type != 'archive_virtual'
                         ORDER BY
                             CASE
                                 WHEN c.container_type = 'archive' AND COALESCE(thumb_counts.slot_count, 0) < 16 THEN 0
@@ -1863,7 +2654,11 @@ fn list_container_children(
             FROM container_children cc
             INNER JOIN containers c ON c.id = cc.child_container_id
             WHERE cc.parent_container_id = ?
-            ORDER BY c.updated_at DESC, c.id DESC
+            ORDER BY
+                CASE WHEN c.container_type = 'archive_virtual' THEN 0 ELSE 1 END ASC,
+                c.display_name ASC,
+                c.updated_at DESC,
+                c.id DESC
             ",
         )
         .map_err(|e| format!("failed to prepare child container query: {e}"))?;
@@ -2100,7 +2895,6 @@ fn cleanup_thumbnail_cache(app: tauri::AppHandle) -> Result<ThumbnailMaintenance
 async fn register_folder(
     app: tauri::AppHandle,
     register_control: tauri::State<'_, RegisterControl>,
-    thumbnail_jobs: tauri::State<'_, ThumbnailJobQueue>,
     folder_path: String,
 ) -> Result<RegisterResult, String> {
     let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -2113,9 +2907,8 @@ async fn register_folder(
     }
 
     let app_handle = app.clone();
-    let register_folder_path = folder_path.clone();
     let join_result = tauri::async_runtime::spawn_blocking(move || {
-        register_folder_blocking(&app_handle, &register_folder_path, cancel_flag)
+        register_folder_blocking(&app_handle, &folder_path, cancel_flag)
     })
         .await
         .map_err(|e| format!("registration task failed to join: {e}"));
@@ -2128,17 +2921,7 @@ async fn register_folder(
         *guard = None;
     }
 
-    let mut outcome = join_result??;
-
-    if !outcome.result.canceled {
-        let job_id = thumbnail_jobs.enqueue_job(folder_path, outcome.thumbnail_tasks)?;
-        outcome.result.background_job_id = job_id;
-        if job_id.is_some() {
-            thumbnail_jobs.ensure_worker(app);
-        }
-    }
-
-    Ok(outcome.result)
+    join_result?
 }
 
 #[tauri::command]
@@ -2275,10 +3058,12 @@ fn search_containers(
     app: tauri::AppHandle,
     path_query: Option<String>,
     name_query: Option<String>,
+    include_archive_virtual: Option<bool>,
     limit: Option<u32>,
 ) -> Result<Vec<ContainerRecord>, String> {
     let conn = open_db(&app)?;
     let cap = limit.unwrap_or(100).min(500);
+    let include_virtual = include_archive_virtual.unwrap_or(true);
 
     let path_pattern = path_query
         .map(|s| s.trim().to_string())
@@ -2307,14 +3092,15 @@ fn search_containers(
             ) AS child_counts ON child_counts.parent_container_id = c.id
             WHERE (?1 IS NULL OR c.source_path LIKE ?1)
               AND (?2 IS NULL OR c.display_name LIKE ?2)
+              AND (?3 = 1 OR c.container_type != 'archive_virtual')
             ORDER BY c.updated_at DESC, c.id DESC
-            LIMIT ?3
+            LIMIT ?4
             ",
         )
         .map_err(|e| format!("failed to prepare container search query: {e}"))?;
 
     let rows = stmt
-        .query_map(params![path_pattern, name_pattern, cap], |row| {
+        .query_map(params![path_pattern, name_pattern, include_virtual, cap], |row| {
             Ok(ContainerRecord {
                 id: row.get(0)?,
                 container_type: row.get(1)?,
@@ -2454,7 +3240,6 @@ fn save_file_classification(
 pub fn run() {
     tauri::Builder::default()
         .manage(RegisterControl::default())
-        .manage(ThumbnailJobQueue::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -2479,7 +3264,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_extension_from_path, scan_archive_extracted_images};
+    use super::{
+        build_non_leaf_aggregate_slots, collect_media_and_nested_archives_in_dir, normalize_extension_from_path,
+        scan_archive_extracted_images,
+    };
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -2531,5 +3319,64 @@ mod tests {
     fn normalize_extension_trims_and_lowercases() {
         let path = Path::new("C:/tmp/FILE.JpEg ");
         assert_eq!(normalize_extension_from_path(path), "jpeg");
+    }
+
+    #[test]
+    fn collect_media_and_nested_archives_orders_and_classifies_entries() {
+        let base = std::env::temp_dir().join(format!(
+            "thumbscontainer_test_virtual_nested_{}",
+            std::process::id()
+        ));
+        if base.exists() {
+            let _ = fs::remove_dir_all(&base);
+        }
+        fs::create_dir_all(&base).expect("failed to create test temp dir");
+
+        let img = base.join("z_dir/frame01.JPG");
+        let video = base.join("a_dir/clip01.MKV");
+        let nested = base.join("m_dir/inner_pack.zip");
+        let other = base.join("readme.txt");
+
+        create_file(&img);
+        create_file(&video);
+        create_file(&nested);
+        create_file(&other);
+
+        let (media, nested_archives) = collect_media_and_nested_archives_in_dir(&base, Some("outer/archive.zip"));
+
+        assert_eq!(media.len(), 2);
+        assert_eq!(nested_archives.len(), 1);
+
+        assert_eq!(media[0].relative_path, "outer/archive.zip/a_dir/clip01.MKV");
+        assert_eq!(media[0].media_kind, "video");
+        assert_eq!(media[1].relative_path, "outer/archive.zip/z_dir/frame01.JPG");
+        assert_eq!(media[1].media_kind, "image");
+
+        assert_eq!(
+            nested_archives[0].archive_logical_path,
+            "outer/archive.zip/m_dir/inner_pack.zip"
+        );
+
+        fs::remove_dir_all(&base).expect("failed to clean up test temp dir");
+    }
+
+    #[test]
+    fn non_leaf_aggregate_distributes_slots_evenly_when_children_are_fewer_than_slots() {
+        let child_slots = vec![
+            vec!["a0".to_string(), "a1".to_string()],
+            vec!["b0".to_string()],
+            vec!["c0".to_string(), "c1".to_string(), "c2".to_string()],
+        ];
+
+        let slots = build_non_leaf_aggregate_slots(&child_slots, 8);
+        assert_eq!(slots.len(), 8);
+
+        // Deterministic round-robin distribution: 3,3,2 allocation across children.
+        let a_count = slots.iter().filter(|v| v.starts_with('a')).count();
+        let b_count = slots.iter().filter(|v| v.starts_with('b')).count();
+        let c_count = slots.iter().filter(|v| v.starts_with('c')).count();
+        assert_eq!(a_count, 3);
+        assert_eq!(b_count, 3);
+        assert_eq!(c_count, 2);
     }
 }

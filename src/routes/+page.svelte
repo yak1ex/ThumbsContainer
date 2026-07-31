@@ -126,6 +126,7 @@
   let searchTag = $state("");
   let searchMinRating = $state("");
   let searchIncludeContainers = $state(true);
+  let searchIncludeArchiveVirtual = $state(true);
   let searchRan = $state(false);
   let selectedFileId = $state<number | null>(null);
   let classTagsInput = $state("");
@@ -412,6 +413,7 @@
         searchContainerResults = await invoke<ContainerRecord[]>("search_containers", {
           pathQuery: searchPath,
           nameQuery: searchFilename,
+          includeArchiveVirtual: searchIncludeArchiveVirtual,
           limit: 250
         });
       } else {
@@ -434,6 +436,7 @@
     searchResults = [];
     searchContainerResults = [];
     searchIncludeContainers = true;
+    searchIncludeArchiveVirtual = true;
     searchRan = false;
     statusMessage = "Search cleared.";
   }
@@ -713,6 +716,14 @@
       <label class="checkbox-row">
         <input type="checkbox" bind:checked={searchIncludeContainers} disabled={searching || loading} />
         Include containers in search target
+      </label>
+      <label class="checkbox-row">
+        <input
+          type="checkbox"
+          bind:checked={searchIncludeArchiveVirtual}
+          disabled={searching || loading || !searchIncludeContainers}
+        />
+        Include archive-derived virtual containers
       </label>
       <div class="actions">
         <button type="submit" disabled={searching || loading}>

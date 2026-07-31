@@ -178,11 +178,15 @@ This section summarizes the current development state and the mainline implement
 ### 12. Archive and nested container policy
 
 * Goal: define predictable handling for nested archives and mixed structures.
+* Implemented:
+  * Applied a consistent nested-archive expansion safety limit in archive-derived virtual hierarchy construction during registration (fixed backend limit, non-user-facing).
+  * Nested archive extraction failures in virtual hierarchy expansion now follow deterministic skip behavior (stable traversal order with non-fatal per-item failure handling).
 * Planned:
   * Add configurable archive traversal depth with safe default.
   * Persist extraction/traversal decisions for reproducibility.
   * Improve error reporting for corrupted archives and unsupported formats.
-* Status: pending.
+  * Keep extraction/skip behavior deterministic for the same input and settings across all archive-processing paths (thumbnail/backfill and virtual hierarchy).
+* Status: in progress.
 
 ### 13. Classification schema evolution
 
@@ -258,18 +262,31 @@ This section summarizes the current development state and the mainline implement
 ### 20. Archive-derived virtual container hierarchy
 
 * Goal: represent archive-internal structure and themes as persistent, searchable container hierarchies.
-* Planned:
-  * Build archive-internal virtual containers during registration from both path hierarchy and media type classification (image/video).
-  * Persist virtual containers and parent/child links in DB as first-class containers.
-  * Apply recursive single-child compression always (non-configurable).
-  * Expand nested archives recursively with a consistent max-depth safety limit aligned with Task 12 policy.
-  * Use full relative path (inside the archive) as virtual container display identity.
-  * Include virtual containers as first-class search targets and provide configurable inclusion in search behavior.
-  * Preview policy:
-    * Leaf virtual containers: sampling-based previews (videos: interval sampling; image leaves: representative sampling).
-    * Non-leaf virtual containers: aggregate first N child previews.
-    * If child count M is less than slot count N, distribute slots across children as evenly as possible and fill all N slots.
-* Status: pending.
+* Implemented:
+  * Slice A: DB schema foundation for archive-derived virtual container metadata persistence (`archive_virtual_container_meta`) keyed by persisted container IDs.
+  * Slice B (registration-time foundation): archive extraction scan now builds virtual hierarchy nodes from internal path structure and media type buckets (image/video), applies recursive single-child compression on path nodes, and persists virtual containers plus parent/child links under the owning archive container.
+  * Virtual containers are persisted as first-class `containers` rows with type `archive_virtual`, linked through `container_children`, and annotated in `archive_virtual_container_meta` with node path, node kind, media kind, depth, and parent virtual container ID.
+  * Re-registration of the same archive container now replaces previous virtual descendants deterministically before inserting rebuilt virtual hierarchy state.
+  * Slice C (registration-time nested expansion): virtual hierarchy scan now recursively expands nested archives up to a fixed safety max depth, merges discovered image/video entries into full logical paths inside the source archive, and skips extraction failures deterministically without aborting registration.
+  * Added init-time schema compatibility migration for `archive_virtual_container_meta` so existing databases with older column layouts are upgraded in place before index creation (including legacy layouts missing `archive_container_id`, `virtual_path`, and `parent_virtual_container_id`). Legacy tables whose PRIMARY KEY column name differs from current schema are now dropped and recreated automatically.
+  * Slice D (registration-time thumbnail assembly): virtual container thumbnails are now rebuilt during archive virtual hierarchy persistence; media leaf nodes use sampling-based generation (image representative sampling and video interval sampling), and non-leaf path nodes aggregate child previews with even slot distribution when child count is below slot count.
+  * Slice E (search integration): archive-derived virtual containers are searchable as first-class container targets via existing container search, with configurable inclusion behavior (include/exclude `archive_virtual` containers) exposed in the Search UI.
+  * Slice F (pre-verification cleanup): `archive_virtual` containers excluded from Recent Containers top-level list; accessible only as children when expanding their parent archive container. Virtual children sorted with archive_virtual entries first then alphabetically by display name.
+* Status: completed.
 * Notes:
   * Initial implementation can assume DB rebuild-from-scratch during registration path migration.
   * Explicit per-archive rebuild/edit/merge/split controls are out of scope for this phase.
+  * Slice F verification confirmed on live datasets:
+    * Single archive with subfolder hierarchy: root `.` appears as direct child of archive container; full virtual path subtree (`folder`, `folder/subfolder1`, `folder/subfolder1/@image`) accessible via container search and "Open in Recent".
+    * Container search toggle: including/excluding `archive_virtual` containers works correctly.
+    * Nested archive (12 sub-archives each with folder/images): logical paths like `subarchive1.rar/folder/@image` built correctly through nested expansion; root `.` lists all 12 sub-containers as children.
+
+### 21. Schema migration cleanup for release hardening
+
+* Goal: remove development-stage compatibility migrations once schema stabilizes for release.
+* Planned:
+  * Identify migration paths that were added only to support active development DB drift (for example, `archive_virtual_container_meta` compatibility column backfills).
+  * Define cutover criteria for removing temporary migrations (for example, DB reset requirement at specific pre-release milestone).
+  * Simplify `init_database` schema setup by dropping temporary compatibility code after cutover criteria are met.
+  * Verify clean initialization and registration behavior on a fresh DB after migration cleanup.
+* Status: pending.
