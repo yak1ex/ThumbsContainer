@@ -13,13 +13,13 @@ Develop a Windows desktop application for registering, organizing, previewing, c
 
 ## Current status
 
-The project has a buildable desktop baseline with completed registration, persistence, classification search, container modeling, registration progress controls, image/video/archive previews, thumbnail maintenance, background thumbnail jobs, archive diagnostics, and archive-derived virtual container hierarchy. Combined-container UX and nested archive policy are in progress. Dedupe flow, classification schema evolution, scale hardening, release reliability, datetime filtering, archive video previews, and migration cleanup remain planned.
+The project has a buildable desktop baseline with completed registration, persistence, classification search, container modeling, registration progress controls, image/video/archive previews, thumbnail maintenance, background thumbnail jobs, archive diagnostics, archive-derived virtual container hierarchy, and combined-container UX and search semantics. Nested archive policy is in progress. Dedupe flow, classification schema evolution, scale hardening, release reliability, datetime filtering, archive video previews, and migration cleanup remain planned.
 
 ## Active task
 
-- Task: T011
-- Current step: Continue combined-container creation/editing and search semantics beyond current search-only integration.
-- Next verification: Run configured frontend and Rust checks, build executable path as needed, and obtain user confirmation for affected UI behavior.
+- Task: T012
+- Current step: Define user-facing nested archive traversal depth policy and persist traversal decisions across archive-processing paths.
+- Next verification: Run configured frontend and Rust checks, then validate nested archive behavior consistency with representative datasets.
 - Waiting on: agent
 - Required action: none
 
@@ -236,7 +236,7 @@ Use stable IDs. Append newly discovered work using the next unused ID. Never reu
 
 ### T011 - Complete combined-container UX and search semantics
 
-- Status: in progress
+- Status: completed
 - Objective: Make combined containers first-class creation, browsing, and search entities.
 - Scope:
   - Search containers directly.
@@ -248,12 +248,36 @@ Use stable IDs. Append newly discovered work using the next unused ID. Never reu
   - Relevant configured checks pass, and user verification is recorded where required.
 - Implemented:
   - Container search, include or exclude toggle, result listing, quick-open behavior, and conditional auto-expansion were implemented.
+  - Combined-container metadata schema was added with include_children_in_search persistence.
+  - Backend commands for create, update, and detail retrieval of combined containers were implemented.
+  - Combined-container thumbnail slots now rebuild from child container thumbnails on create or update.
+  - Search semantics now hide child containers when any parent combined container has child inclusion disabled.
+  - Frontend combined-container editor was added with create, edit, child selection, and include-children toggle support.
+  - Container search and recent-container views now show combined child-search visibility state and provide combined edit actions.
+  - Search now includes an explicit `Respect combined child visibility` toggle so users can directly see the effect of combined child visibility rules.
+  - Combined-container child selection now uses a dedicated container-candidate loader with query filtering and optional archive-virtual inclusion, removing the previous reliance on limited Recent Containers.
+  - Combined containers can now be deleted explicitly with confirmation from both editor and container tables, enabling one-action ungroup and removal.
+  - Search visibility label text was clarified to indicate that checked state applies combined child-visibility rules.
 - Verification:
-  - Implemented search behavior is recorded in source project history.
+  - npm run check passed.
+  - npm run build passed.
+  - cargo check passed.
+  - cargo test --lib passed (4 passed, 0 failed).
+  - npm run check passed after feedback-driven UX updates.
+  - npm run build passed after feedback-driven UX updates.
+  - cargo check passed after feedback-driven UX updates.
+  - cargo test --lib passed after feedback-driven UX updates (4 passed, 0 failed).
+  - npm run check passed after combined delete and label updates.
+  - npm run build passed after combined delete and label updates.
+  - cargo check passed after combined delete and label updates.
+  - cargo test --lib passed after combined delete and label updates (4 passed, 0 failed).
+  - User verification confirmed delete from Search and Recent Containers removes only the combined container while children remain.
+  - User verification confirmed delete from Combined Containers editor matches the same behavior.
+  - User verification confirmed updated visibility semantics label is clearer and behavior is reasonable.
 - Remaining:
-  - Combined-container creation and editing, child visibility semantics, result thumbnails, and navigation improvements remain.
+  - None.
 - Notes:
-  - Awaiting user verification for UI and workflow semantics after additional implementation.
+  - Search criteria differentiation between Name and Source Path for combined versus filesystem-backed containers remains a potential future UX refinement.
 
 ### T012 - Define nested archive traversal policy
 

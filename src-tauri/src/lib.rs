@@ -57,6 +57,7 @@ struct ContainerRecord {
     source_path: String,
     updated_at: String,
     child_count: i64,
+    include_children_in_search: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -65,6 +66,17 @@ struct ContainerChildRecord {
     container_type: String,
     display_name: String,
     source_path: String,
+    updated_at: String,
+    child_count: i64,
+    include_children_in_search: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct CombinedContainerDetail {
+    container_id: i64,
+    display_name: String,
+    include_children_in_search: bool,
+    child_container_ids: Vec<i64>,
 }
 
 #[derive(Serialize)]
@@ -281,6 +293,7 @@ fn init_database(app: tauri::AppHandle) -> Result<String, String> {
     .map_err(|e| format!("failed to create schema: {e}"))?;
 
     ensure_archive_virtual_container_meta_schema(&conn)?;
+    ensure_combined_container_meta_schema(&conn)?;
 
     Ok("database ready".to_string())
 }
@@ -412,6 +425,26 @@ fn ensure_archive_virtual_container_meta_schema(conn: &Connection) -> Result<(),
         ",
     )
     .map_err(|e| format!("failed to create archive virtual metadata indexes: {e}"))?;
+
+    Ok(())
+}
+
+fn ensure_combined_container_meta_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS combined_container_meta (
+            container_id INTEGER PRIMARY KEY,
+            include_children_in_search INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (container_id) REFERENCES containers(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_combined_container_meta_include_children
+            ON combined_container_meta(include_children_in_search);
+        ",
+    )
+    .map_err(|e| format!("failed to create combined container metadata schema: {e}"))?;
 
     Ok(())
 }
@@ -1880,6 +1913,100 @@ fn upsert_group_container(
     Ok((conn.last_insert_rowid(), true))
 }
 
+fn insert_combined_container_child_links(
+    conn: &Connection,
+    parent_container_id: i64,
+    child_container_ids: &[i64],
+) -> Result<(), String> {
+    let mut seen: HashSet<i64> = HashSet::new();
+
+    for child_id in child_container_ids {
+        if *child_id <= 0 || *child_id == parent_container_id || !seen.insert(*child_id) {
+            continue;
+        }
+
+        let child_exists = conn
+            .query_row(
+                "SELECT 1 FROM containers WHERE id = ?",
+                [child_id],
+                |_| Ok(()),
+            )
+            .is_ok();
+
+        if !child_exists {
+            return Err(format!("child container {child_id} does not exist"));
+        }
+
+        conn.execute(
+            "
+            INSERT OR IGNORE INTO container_children(parent_container_id, child_container_id)
+            VALUES (?, ?)
+            ",
+            params![parent_container_id, child_id],
+        )
+        .map_err(|e| {
+            format!(
+                "failed to link combined container {parent_container_id} to child {child_id}: {e}"
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn rebuild_combined_container_thumbnail_slots(
+    conn: &Connection,
+    container_id: i64,
+    slot_limit: u32,
+) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM container_thumbnails WHERE container_id = ?",
+        [container_id],
+    )
+    .map_err(|e| {
+        format!("failed to clear previous thumbnails for combined container {container_id}: {e}")
+    })?;
+
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT ct.thumbnail_path
+            FROM container_children cc
+            INNER JOIN containers c ON c.id = cc.child_container_id
+            INNER JOIN container_thumbnails ct ON ct.container_id = cc.child_container_id
+            WHERE cc.parent_container_id = ?
+            ORDER BY c.updated_at DESC, c.id DESC, ct.slot_index ASC
+            LIMIT ?
+            ",
+        )
+        .map_err(|e| {
+            format!(
+                "failed to prepare thumbnail aggregation query for combined container {container_id}: {e}"
+            )
+        })?;
+
+    let rows = stmt
+        .query_map(params![container_id, slot_limit], |row| row.get::<_, String>(0))
+        .map_err(|e| {
+            format!(
+                "failed to query thumbnail aggregation rows for combined container {container_id}: {e}"
+            )
+        })?;
+
+    let mut slot_index: i64 = 0;
+    for row in rows {
+        let thumb_path = row.map_err(|e| {
+            format!(
+                "failed to map thumbnail aggregation row for combined container {container_id}: {e}"
+            )
+        })?;
+        upsert_container_thumbnail(conn, container_id, slot_index, &thumb_path)?;
+        slot_index += 1;
+    }
+
+    Ok(())
+}
+
 fn is_image_extension(ext: &str) -> bool {
     matches!(ext, "jpg" | "jpeg" | "png" | "gif" | "webp" | "avif")
 }
@@ -2531,13 +2658,18 @@ fn list_recent_containers(
                             c.display_name,
                             c.source_path,
                             c.updated_at,
-                            COALESCE(child_counts.child_count, 0) AS child_count
+                            COALESCE(child_counts.child_count, 0) AS child_count,
+                            CASE
+                                WHEN c.container_type = 'combined' THEN COALESCE(ccm.include_children_in_search, 1)
+                                ELSE NULL
+                            END AS include_children_in_search
                         FROM containers AS c
                         LEFT JOIN (
                             SELECT parent_container_id, COUNT(*) AS child_count
                             FROM container_children
                             GROUP BY parent_container_id
                         ) AS child_counts ON child_counts.parent_container_id = c.id
+                        LEFT JOIN combined_container_meta ccm ON ccm.container_id = c.id
                         LEFT JOIN (
                             SELECT container_id, COUNT(*) AS slot_count
                             FROM container_thumbnails
@@ -2565,6 +2697,7 @@ fn list_recent_containers(
                 source_path: row.get(3)?,
                 updated_at: row.get(4)?,
                 child_count: row.get(5)?,
+                include_children_in_search: row.get::<_, Option<i64>>(6)?.map(|v| v != 0),
             })
         })
         .map_err(|e| format!("failed to query containers: {e}"))?;
@@ -2587,9 +2720,25 @@ fn list_container_children(
     let mut stmt = conn
         .prepare(
             "
-            SELECT c.id, c.container_type, c.display_name, c.source_path
+            SELECT
+                c.id,
+                c.container_type,
+                c.display_name,
+                c.source_path,
+                c.updated_at,
+                COALESCE(child_counts.child_count, 0) AS child_count,
+                CASE
+                    WHEN c.container_type = 'combined' THEN COALESCE(ccm.include_children_in_search, 1)
+                    ELSE NULL
+                END AS include_children_in_search
             FROM container_children cc
             INNER JOIN containers c ON c.id = cc.child_container_id
+            LEFT JOIN (
+                SELECT parent_container_id, COUNT(*) AS child_count
+                FROM container_children
+                GROUP BY parent_container_id
+            ) AS child_counts ON child_counts.parent_container_id = c.id
+            LEFT JOIN combined_container_meta ccm ON ccm.container_id = c.id
             WHERE cc.parent_container_id = ?
             ORDER BY
                 CASE WHEN c.container_type = 'archive_virtual' THEN 0 ELSE 1 END ASC,
@@ -2607,6 +2756,9 @@ fn list_container_children(
                 container_type: row.get(1)?,
                 display_name: row.get(2)?,
                 source_path: row.get(3)?,
+                updated_at: row.get(4)?,
+                child_count: row.get(5)?,
+                include_children_in_search: row.get::<_, Option<i64>>(6)?.map(|v| v != 0),
             })
         })
         .map_err(|e| format!("failed to query child containers: {e}"))?;
@@ -2996,11 +3148,13 @@ fn search_containers(
     path_query: Option<String>,
     name_query: Option<String>,
     include_archive_virtual: Option<bool>,
+    respect_combined_child_visibility: Option<bool>,
     limit: Option<u32>,
 ) -> Result<Vec<ContainerRecord>, String> {
     let conn = open_db(&app)?;
     let cap = limit.unwrap_or(100).min(500);
     let include_virtual = include_archive_virtual.unwrap_or(true);
+    let respect_child_visibility = respect_combined_child_visibility.unwrap_or(true);
 
     let path_pattern = path_query
         .map(|s| s.trim().to_string())
@@ -3020,24 +3174,48 @@ fn search_containers(
                 c.display_name,
                 c.source_path,
                 c.updated_at,
-                COALESCE(child_counts.child_count, 0) AS child_count
+                                COALESCE(child_counts.child_count, 0) AS child_count,
+                                CASE
+                                        WHEN c.container_type = 'combined' THEN COALESCE(ccm.include_children_in_search, 1)
+                                        ELSE NULL
+                                END AS include_children_in_search
             FROM containers AS c
             LEFT JOIN (
                 SELECT parent_container_id, COUNT(*) AS child_count
                 FROM container_children
                 GROUP BY parent_container_id
             ) AS child_counts ON child_counts.parent_container_id = c.id
+                        LEFT JOIN combined_container_meta ccm ON ccm.container_id = c.id
             WHERE (?1 IS NULL OR c.source_path LIKE ?1)
               AND (?2 IS NULL OR c.display_name LIKE ?2)
               AND (?3 = 1 OR c.container_type != 'archive_virtual')
+              AND (
+                  ?4 = 0 OR NOT EXISTS (
+                      SELECT 1
+                      FROM container_children cc_hidden
+                      INNER JOIN containers parent_c ON parent_c.id = cc_hidden.parent_container_id
+                      LEFT JOIN combined_container_meta hidden_meta ON hidden_meta.container_id = parent_c.id
+                      WHERE cc_hidden.child_container_id = c.id
+                        AND parent_c.container_type = 'combined'
+                        AND COALESCE(hidden_meta.include_children_in_search, 1) = 0
+                  )
+              )
             ORDER BY c.updated_at DESC, c.id DESC
-            LIMIT ?4
+            LIMIT ?5
             ",
         )
         .map_err(|e| format!("failed to prepare container search query: {e}"))?;
 
     let rows = stmt
-        .query_map(params![path_pattern, name_pattern, include_virtual, cap], |row| {
+        .query_map(
+            params![
+                path_pattern,
+                name_pattern,
+                include_virtual,
+                respect_child_visibility,
+                cap
+            ],
+            |row| {
             Ok(ContainerRecord {
                 id: row.get(0)?,
                 container_type: row.get(1)?,
@@ -3045,8 +3223,10 @@ fn search_containers(
                 source_path: row.get(3)?,
                 updated_at: row.get(4)?,
                 child_count: row.get(5)?,
+                include_children_in_search: row.get::<_, Option<i64>>(6)?.map(|v| v != 0),
             })
-        })
+        },
+        )
         .map_err(|e| format!("failed to query container search results: {e}"))?;
 
     let mut out = Vec::new();
@@ -3054,6 +3234,357 @@ fn search_containers(
         out.push(row.map_err(|e| format!("failed to map container search row: {e}"))?);
     }
     Ok(out)
+}
+
+#[tauri::command]
+fn list_containers_for_combining(
+    app: tauri::AppHandle,
+    query: Option<String>,
+    include_archive_virtual: Option<bool>,
+    limit: Option<u32>,
+) -> Result<Vec<ContainerRecord>, String> {
+    let conn = open_db(&app)?;
+    let cap = limit.unwrap_or(300).min(1000);
+    let include_virtual = include_archive_virtual.unwrap_or(false);
+
+    let pattern = query
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("%{s}%"));
+
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT
+                c.id,
+                c.container_type,
+                c.display_name,
+                c.source_path,
+                c.updated_at,
+                COALESCE(child_counts.child_count, 0) AS child_count,
+                CASE
+                    WHEN c.container_type = 'combined' THEN COALESCE(ccm.include_children_in_search, 1)
+                    ELSE NULL
+                END AS include_children_in_search
+            FROM containers c
+            LEFT JOIN (
+                SELECT parent_container_id, COUNT(*) AS child_count
+                FROM container_children
+                GROUP BY parent_container_id
+            ) AS child_counts ON child_counts.parent_container_id = c.id
+            LEFT JOIN combined_container_meta ccm ON ccm.container_id = c.id
+            WHERE (?1 IS NULL OR c.display_name LIKE ?1 OR c.source_path LIKE ?1)
+              AND (?2 = 1 OR c.container_type != 'archive_virtual')
+            ORDER BY c.updated_at DESC, c.id DESC
+            LIMIT ?3
+            ",
+        )
+        .map_err(|e| format!("failed to prepare combine candidate query: {e}"))?;
+
+    let rows = stmt
+        .query_map(params![pattern, include_virtual, cap], |row| {
+            Ok(ContainerRecord {
+                id: row.get(0)?,
+                container_type: row.get(1)?,
+                display_name: row.get(2)?,
+                source_path: row.get(3)?,
+                updated_at: row.get(4)?,
+                child_count: row.get(5)?,
+                include_children_in_search: row.get::<_, Option<i64>>(6)?.map(|v| v != 0),
+            })
+        })
+        .map_err(|e| format!("failed to query combine candidates: {e}"))?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("failed to map combine candidate row: {e}"))?);
+    }
+
+    Ok(out)
+}
+
+#[tauri::command]
+fn create_combined_container(
+    app: tauri::AppHandle,
+    display_name: String,
+    child_container_ids: Vec<i64>,
+    include_children_in_search: Option<bool>,
+) -> Result<ContainerRecord, String> {
+    let mut conn = open_db(&app)?;
+    let trimmed_name = display_name.trim();
+    if trimmed_name.is_empty() {
+        return Err("combined container name is required".to_string());
+    }
+
+    let include_children = include_children_in_search.unwrap_or(true);
+    let source_path = format!(
+        "combined://{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("failed to generate combined container source path: {e}"))?
+            .as_nanos()
+    );
+
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("failed to start create combined transaction: {e}"))?;
+
+    tx.execute(
+        "
+        INSERT INTO containers(container_type, display_name, source_path)
+        VALUES ('combined', ?, ?)
+        ",
+        params![trimmed_name, source_path],
+    )
+    .map_err(|e| format!("failed to insert combined container: {e}"))?;
+
+    let container_id = tx.last_insert_rowid();
+
+    tx.execute(
+        "
+        INSERT INTO combined_container_meta(container_id, include_children_in_search, created_at, updated_at)
+        VALUES (?, ?, datetime('now'), datetime('now'))
+        ",
+        params![container_id, if include_children { 1 } else { 0 }],
+    )
+    .map_err(|e| format!("failed to insert combined container metadata: {e}"))?;
+
+    insert_combined_container_child_links(&tx, container_id, &child_container_ids)?;
+
+    tx.commit()
+        .map_err(|e| format!("failed to commit combined container creation: {e}"))?;
+
+    rebuild_combined_container_thumbnail_slots(&conn, container_id, 16)?;
+
+    conn.query_row(
+        "
+        SELECT
+            c.id,
+            c.container_type,
+            c.display_name,
+            c.source_path,
+            c.updated_at,
+            COALESCE(child_counts.child_count, 0) AS child_count,
+            CASE
+                WHEN c.container_type = 'combined' THEN COALESCE(ccm.include_children_in_search, 1)
+                ELSE NULL
+            END AS include_children_in_search
+        FROM containers c
+        LEFT JOIN (
+            SELECT parent_container_id, COUNT(*) AS child_count
+            FROM container_children
+            GROUP BY parent_container_id
+        ) AS child_counts ON child_counts.parent_container_id = c.id
+        LEFT JOIN combined_container_meta ccm ON ccm.container_id = c.id
+        WHERE c.id = ?
+        ",
+        [container_id],
+        |row| {
+            Ok(ContainerRecord {
+                id: row.get(0)?,
+                container_type: row.get(1)?,
+                display_name: row.get(2)?,
+                source_path: row.get(3)?,
+                updated_at: row.get(4)?,
+                child_count: row.get(5)?,
+                include_children_in_search: row.get::<_, Option<i64>>(6)?.map(|v| v != 0),
+            })
+        },
+    )
+    .map_err(|e| format!("failed to load created combined container: {e}"))
+}
+
+#[tauri::command]
+fn update_combined_container(
+    app: tauri::AppHandle,
+    container_id: i64,
+    display_name: String,
+    child_container_ids: Vec<i64>,
+    include_children_in_search: Option<bool>,
+) -> Result<ContainerRecord, String> {
+    let mut conn = open_db(&app)?;
+    let trimmed_name = display_name.trim();
+    if trimmed_name.is_empty() {
+        return Err("combined container name is required".to_string());
+    }
+
+    let container_type = conn
+        .query_row(
+            "SELECT container_type FROM containers WHERE id = ?",
+            [container_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|e| format!("failed to resolve combined container {container_id}: {e}"))?;
+    if container_type != "combined" {
+        return Err(format!("container {container_id} is not a combined container"));
+    }
+
+    let include_children = include_children_in_search.unwrap_or(true);
+
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("failed to start update combined transaction: {e}"))?;
+
+    tx.execute(
+        "
+        UPDATE containers
+        SET display_name = ?, updated_at = datetime('now')
+        WHERE id = ?
+        ",
+        params![trimmed_name, container_id],
+    )
+    .map_err(|e| format!("failed to update combined container {container_id}: {e}"))?;
+
+    tx.execute(
+        "
+        INSERT INTO combined_container_meta(container_id, include_children_in_search, created_at, updated_at)
+        VALUES (?, ?, datetime('now'), datetime('now'))
+        ON CONFLICT(container_id) DO UPDATE SET
+            include_children_in_search = excluded.include_children_in_search,
+            updated_at = datetime('now')
+        ",
+        params![container_id, if include_children { 1 } else { 0 }],
+    )
+    .map_err(|e| format!("failed to update combined container metadata for {container_id}: {e}"))?;
+
+    tx.execute(
+        "DELETE FROM container_children WHERE parent_container_id = ?",
+        [container_id],
+    )
+    .map_err(|e| format!("failed to clear combined container child links for {container_id}: {e}"))?;
+
+    insert_combined_container_child_links(&tx, container_id, &child_container_ids)?;
+
+    tx.commit()
+        .map_err(|e| format!("failed to commit combined container update for {container_id}: {e}"))?;
+
+    rebuild_combined_container_thumbnail_slots(&conn, container_id, 16)?;
+
+    conn.query_row(
+        "
+        SELECT
+            c.id,
+            c.container_type,
+            c.display_name,
+            c.source_path,
+            c.updated_at,
+            COALESCE(child_counts.child_count, 0) AS child_count,
+            CASE
+                WHEN c.container_type = 'combined' THEN COALESCE(ccm.include_children_in_search, 1)
+                ELSE NULL
+            END AS include_children_in_search
+        FROM containers c
+        LEFT JOIN (
+            SELECT parent_container_id, COUNT(*) AS child_count
+            FROM container_children
+            GROUP BY parent_container_id
+        ) AS child_counts ON child_counts.parent_container_id = c.id
+        LEFT JOIN combined_container_meta ccm ON ccm.container_id = c.id
+        WHERE c.id = ?
+        ",
+        [container_id],
+        |row| {
+            Ok(ContainerRecord {
+                id: row.get(0)?,
+                container_type: row.get(1)?,
+                display_name: row.get(2)?,
+                source_path: row.get(3)?,
+                updated_at: row.get(4)?,
+                child_count: row.get(5)?,
+                include_children_in_search: row.get::<_, Option<i64>>(6)?.map(|v| v != 0),
+            })
+        },
+    )
+    .map_err(|e| format!("failed to load updated combined container {container_id}: {e}"))
+}
+
+#[tauri::command]
+fn get_combined_container_detail(
+    app: tauri::AppHandle,
+    container_id: i64,
+) -> Result<CombinedContainerDetail, String> {
+    let conn = open_db(&app)?;
+
+    let (display_name, container_type, include_children) = conn
+        .query_row(
+            "
+            SELECT
+                c.display_name,
+                c.container_type,
+                COALESCE(ccm.include_children_in_search, 1)
+            FROM containers c
+            LEFT JOIN combined_container_meta ccm ON ccm.container_id = c.id
+            WHERE c.id = ?
+            ",
+            [container_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .map_err(|e| format!("failed to load combined container detail for {container_id}: {e}"))?;
+
+    if container_type != "combined" {
+        return Err(format!("container {container_id} is not a combined container"));
+    }
+
+    let mut child_stmt = conn
+        .prepare(
+            "
+            SELECT child_container_id
+            FROM container_children
+            WHERE parent_container_id = ?
+            ORDER BY child_container_id ASC
+            ",
+        )
+        .map_err(|e| format!("failed to prepare combined container child query: {e}"))?;
+    let child_rows = child_stmt
+        .query_map([container_id], |row| row.get::<_, i64>(0))
+        .map_err(|e| format!("failed to query combined container children: {e}"))?;
+
+    let mut child_container_ids = Vec::new();
+    for row in child_rows {
+        child_container_ids
+            .push(row.map_err(|e| format!("failed to map combined container child row: {e}"))?);
+    }
+
+    Ok(CombinedContainerDetail {
+        container_id,
+        display_name,
+        include_children_in_search: include_children != 0,
+        child_container_ids,
+    })
+}
+
+#[tauri::command]
+fn delete_combined_container(app: tauri::AppHandle, container_id: i64) -> Result<String, String> {
+    let conn = open_db(&app)?;
+
+    let container_type = conn
+        .query_row(
+            "SELECT container_type FROM containers WHERE id = ?",
+            [container_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|e| format!("failed to resolve combined container {container_id}: {e}"))?;
+
+    if container_type != "combined" {
+        return Err(format!("container {container_id} is not a combined container"));
+    }
+
+    let deleted = conn
+        .execute("DELETE FROM containers WHERE id = ?", [container_id])
+        .map_err(|e| format!("failed to delete combined container {container_id}: {e}"))?;
+
+    if deleted == 0 {
+        return Err(format!("combined container {container_id} was not deleted"));
+    }
+
+    Ok(format!("combined container {container_id} deleted"))
 }
 
 #[tauri::command]
@@ -3192,6 +3723,11 @@ pub fn run() {
             cleanup_thumbnail_cache,
             search_files,
             search_containers,
+            list_containers_for_combining,
+            create_combined_container,
+            update_combined_container,
+            get_combined_container_detail,
+            delete_combined_container,
             get_file_classification,
             save_file_classification
         ])

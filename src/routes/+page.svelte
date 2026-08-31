@@ -55,6 +55,7 @@
     source_path: string;
     updated_at: string;
     child_count: number;
+    include_children_in_search: boolean | null;
   };
 
   type ContainerChildRecord = {
@@ -62,6 +63,16 @@
     container_type: string;
     display_name: string;
     source_path: string;
+    updated_at: string;
+    child_count: number;
+    include_children_in_search: boolean | null;
+  };
+
+  type CombinedContainerDetail = {
+    container_id: number;
+    display_name: string;
+    include_children_in_search: boolean;
+    child_container_ids: number[];
   };
 
   type ContainerThumbnailRecord = {
@@ -121,12 +132,23 @@
   let searchResults = $state<FileRecord[]>([]);
   let searchContainerResults = $state<ContainerRecord[]>([]);
   let focusedContainerId = $state<number | null>(null);
+  let combinedEditorOpen = $state(false);
+  let combinedEditContainerId = $state<number | null>(null);
+  let combinedNameInput = $state("");
+  let combinedIncludeChildrenInSearch = $state(true);
+  let combinedChildSelection = $state<Record<number, boolean>>({});
+  let combinedCandidateQuery = $state("");
+  let combinedCandidateIncludeArchiveVirtual = $state(false);
+  let combinedCandidates = $state<ContainerRecord[]>([]);
+  let combinedCandidatesLoading = $state(false);
+  let combinedBusy = $state(false);
   let searchPath = $state("");
   let searchFilename = $state("");
   let searchTag = $state("");
   let searchMinRating = $state("");
   let searchIncludeContainers = $state(true);
   let searchIncludeArchiveVirtual = $state(true);
+  let searchRespectCombinedChildVisibility = $state(true);
   let searchRan = $state(false);
   let selectedFileId = $state<number | null>(null);
   let classTagsInput = $state("");
@@ -239,6 +261,26 @@
 
     const ids = recentContainers.map((container) => container.id);
     await Promise.all(ids.map((id) => loadContainerThumbnails(id, forceThumbReload)));
+  }
+
+  async function loadCombineCandidates() {
+    if (combinedCandidatesLoading) {
+      return;
+    }
+
+    combinedCandidatesLoading = true;
+    try {
+      combinedCandidates = await invoke<ContainerRecord[]>("list_containers_for_combining", {
+        query: combinedCandidateQuery,
+        includeArchiveVirtual: combinedCandidateIncludeArchiveVirtual,
+        limit: 500
+      });
+    } catch (error) {
+      combinedCandidates = [];
+      statusMessage = `Failed to load containers for combining: ${String(error)}`;
+    } finally {
+      combinedCandidatesLoading = false;
+    }
   }
 
   async function toggleContainerChildren(containerId: number) {
@@ -379,12 +421,196 @@
     row?.scrollIntoView({ behavior: "smooth", block: "center" });
   }
 
+  function setCombinedEditorSelections(ids: number[]) {
+    const next: Record<number, boolean> = {};
+    for (const id of ids) {
+      if (id > 0) {
+        next[id] = true;
+      }
+    }
+    combinedChildSelection = next;
+  }
+
+  function selectedCombinedChildIds(): number[] {
+    return Object.entries(combinedChildSelection)
+      .filter((entry) => entry[1])
+      .map((entry) => Number(entry[0]))
+      .filter((id) => Number.isInteger(id) && id > 0)
+      .sort((a, b) => a - b);
+  }
+
+  function resetCombinedEditor() {
+    combinedEditorOpen = false;
+    combinedEditContainerId = null;
+    combinedNameInput = "";
+    combinedIncludeChildrenInSearch = true;
+    combinedChildSelection = {};
+    combinedCandidateQuery = "";
+    combinedCandidates = [];
+    combinedBusy = false;
+  }
+
+  async function startCreateCombinedContainer() {
+    combinedEditorOpen = true;
+    combinedEditContainerId = null;
+    combinedNameInput = "";
+    combinedIncludeChildrenInSearch = true;
+    combinedChildSelection = {};
+    combinedCandidateQuery = "";
+    await loadCombineCandidates();
+    statusMessage = "Creating new combined container.";
+  }
+
+  async function startEditCombinedContainer(container: ContainerRecord) {
+    if (combinedBusy) {
+      return;
+    }
+    if (container.container_type !== "combined") {
+      statusMessage = `Container ${container.id} is not editable as combined.`;
+      return;
+    }
+
+    combinedBusy = true;
+    statusMessage = `Loading combined container ${container.id}...`;
+    try {
+      const detail = await invoke<CombinedContainerDetail>("get_combined_container_detail", {
+        containerId: container.id
+      });
+      combinedEditorOpen = true;
+      combinedEditContainerId = container.id;
+      combinedNameInput = detail.display_name;
+      combinedIncludeChildrenInSearch = detail.include_children_in_search;
+      setCombinedEditorSelections(detail.child_container_ids);
+      combinedCandidateQuery = "";
+      await loadCombineCandidates();
+      statusMessage = `Editing combined container ${container.id}.`;
+    } catch (error) {
+      statusMessage = `Failed to load combined container ${container.id}: ${String(error)}`;
+    } finally {
+      combinedBusy = false;
+    }
+  }
+
+  function toggleCombinedChildSelection(containerId: number) {
+    combinedChildSelection = {
+      ...combinedChildSelection,
+      [containerId]: !combinedChildSelection[containerId]
+    };
+  }
+
+  async function saveCombinedContainer() {
+    if (combinedBusy) {
+      return;
+    }
+
+    const displayName = combinedNameInput.trim();
+    if (!displayName) {
+      statusMessage = "Combined container name is required.";
+      return;
+    }
+
+    const childContainerIds = selectedCombinedChildIds();
+    if (combinedEditContainerId !== null) {
+      const selfIndex = childContainerIds.indexOf(combinedEditContainerId);
+      if (selfIndex >= 0) {
+        childContainerIds.splice(selfIndex, 1);
+      }
+    }
+
+    combinedBusy = true;
+    const isEdit = combinedEditContainerId !== null;
+    statusMessage = isEdit
+      ? `Updating combined container ${combinedEditContainerId}...`
+      : "Creating combined container...";
+
+    try {
+      const payload = {
+        displayName,
+        childContainerIds,
+        includeChildrenInSearch: combinedIncludeChildrenInSearch
+      };
+
+      const saved = isEdit
+        ? await invoke<ContainerRecord>("update_combined_container", {
+            containerId: combinedEditContainerId,
+            ...payload
+          })
+        : await invoke<ContainerRecord>("create_combined_container", payload);
+
+      await loadRecentContainers(true);
+      await openContainerInRecent(saved);
+      statusMessage = isEdit
+        ? `Combined container ${saved.id} updated.`
+        : `Combined container ${saved.id} created.`;
+      resetCombinedEditor();
+    } catch (error) {
+      statusMessage = `Failed to save combined container: ${String(error)}`;
+    } finally {
+      combinedBusy = false;
+    }
+  }
+
+  async function deleteCombinedContainerById(containerId: number, displayName: string) {
+    if (combinedBusy) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Delete combined container ${containerId} (${displayName})? This removes the combined container and its child links.`
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    combinedBusy = true;
+    statusMessage = `Deleting combined container ${containerId}...`;
+    try {
+      await invoke<string>("delete_combined_container", {
+        containerId
+      });
+
+      if (combinedEditContainerId === containerId) {
+        resetCombinedEditor();
+      }
+
+      focusedContainerId = focusedContainerId === containerId ? null : focusedContainerId;
+      recentContainers = recentContainers.filter((v) => v.id !== containerId);
+      searchContainerResults = searchContainerResults.filter((v) => v.id !== containerId);
+      await loadCombineCandidates();
+      await loadRecentContainers(true);
+      statusMessage = `Combined container ${containerId} deleted.`;
+    } catch (error) {
+      statusMessage = `Failed to delete combined container ${containerId}: ${String(error)}`;
+    } finally {
+      combinedBusy = false;
+    }
+  }
+
+  async function deleteCombinedContainer(container: ContainerRecord) {
+    if (container.container_type !== "combined") {
+      statusMessage = `Container ${container.id} is not deletable as combined.`;
+      return;
+    }
+    await deleteCombinedContainerById(container.id, container.display_name);
+  }
+
+  function isSelectableCombinedChild(container: ContainerRecord): boolean {
+    if (container.container_type === "archive_virtual") {
+      return false;
+    }
+    if (combinedEditContainerId !== null && container.id === combinedEditContainerId) {
+      return false;
+    }
+    return true;
+  }
+
   async function initialize() {
     try {
       await invoke<string>("init_database");
       statusMessage = "Database is ready.";
       await loadRecentFiles();
       await loadRecentContainers();
+      await loadCombineCandidates();
     } catch (error) {
       statusMessage = `Initialization failed: ${String(error)}`;
     }
@@ -414,6 +640,7 @@
           pathQuery: searchPath,
           nameQuery: searchFilename,
           includeArchiveVirtual: searchIncludeArchiveVirtual,
+          respectCombinedChildVisibility: searchRespectCombinedChildVisibility,
           limit: 250
         });
       } else {
@@ -437,6 +664,7 @@
     searchContainerResults = [];
     searchIncludeContainers = true;
     searchIncludeArchiveVirtual = true;
+    searchRespectCombinedChildVisibility = true;
     searchRan = false;
     statusMessage = "Search cleared.";
   }
@@ -691,6 +919,108 @@
   </section>
 
   <section class="panel">
+    <h2>Combined Containers</h2>
+    <div class="actions">
+      <button type="button" onclick={startCreateCombinedContainer} disabled={loading || combinedBusy}>
+        New Combined Container
+      </button>
+      {#if combinedEditorOpen}
+        <button type="button" class="secondary" onclick={resetCombinedEditor} disabled={combinedBusy}>
+          Close Editor
+        </button>
+      {/if}
+    </div>
+
+    {#if combinedEditorOpen}
+      <form class="register-form combined-editor" onsubmit={(e) => e.preventDefault()}>
+        <input
+          placeholder="Combined container name"
+          bind:value={combinedNameInput}
+          disabled={combinedBusy}
+        />
+        <label class="checkbox-row">
+          <input type="checkbox" bind:checked={combinedIncludeChildrenInSearch} disabled={combinedBusy} />
+          Include children in container search results
+        </label>
+        <p class="muted">
+          This setting affects Search when "Respect combined child visibility" is enabled there.
+        </p>
+        <div class="actions">
+          <input
+            placeholder="Find containers to add (name or source path)"
+            bind:value={combinedCandidateQuery}
+            disabled={combinedBusy || combinedCandidatesLoading}
+          />
+          <label class="checkbox-row">
+            <input
+              type="checkbox"
+              bind:checked={combinedCandidateIncludeArchiveVirtual}
+              disabled={combinedBusy || combinedCandidatesLoading}
+            />
+            Include archive-derived virtual containers
+          </label>
+          <button
+            type="button"
+            class="secondary"
+            onclick={loadCombineCandidates}
+            disabled={combinedBusy || combinedCandidatesLoading}
+          >
+            {combinedCandidatesLoading ? "Loading..." : "Load Candidates"}
+          </button>
+        </div>
+        <p class="muted">
+          Select child containers from candidates (not limited to Recent Containers).
+        </p>
+        <div class="combined-child-picker">
+          {#if combinedCandidatesLoading}
+            <p class="muted">Loading candidates...</p>
+          {:else if combinedCandidates.length === 0}
+            <p class="muted">No matching containers. Adjust filters and load again.</p>
+          {:else}
+            {#each combinedCandidates as candidate}
+              {#if isSelectableCombinedChild(candidate)}
+                <label class="checkbox-row combined-child-option">
+                  <input
+                    type="checkbox"
+                    checked={!!combinedChildSelection[candidate.id]}
+                    oninput={() => toggleCombinedChildSelection(candidate.id)}
+                    disabled={combinedBusy}
+                  />
+                  <span>{candidate.display_name}</span>
+                  <span class="muted">#{candidate.id} • {candidate.container_type} • {candidate.child_count} child(ren)</span>
+                </label>
+              {/if}
+            {/each}
+          {/if}
+        </div>
+        <div class="actions">
+          <button type="button" onclick={saveCombinedContainer} disabled={combinedBusy}>
+            {combinedBusy
+              ? "Saving..."
+              : combinedEditContainerId === null
+                ? "Create Combined Container"
+                : "Save Combined Container"}
+          </button>
+          {#if combinedEditContainerId !== null}
+            <button
+              type="button"
+              class="danger"
+              onclick={() => {
+                if (combinedEditContainerId !== null) {
+                  void deleteCombinedContainerById(combinedEditContainerId, combinedNameInput || "(unnamed)");
+                }
+              }}
+              disabled={combinedBusy}
+            >
+              Delete Combined Container
+            </button>
+          {/if}
+        </div>
+      </form>
+    {/if}
+  </section>
+
+  <section class="panel">
     <h2>Search</h2>
     <form class="register-form" onsubmit={runSearch}>
       <input
@@ -724,6 +1054,14 @@
           disabled={searching || loading || !searchIncludeContainers}
         />
         Include archive-derived virtual containers
+      </label>
+      <label class="checkbox-row">
+        <input
+          type="checkbox"
+          bind:checked={searchRespectCombinedChildVisibility}
+          disabled={searching || loading || !searchIncludeContainers}
+        />
+        Apply combined child visibility rules (hide children when parent combined container is Hidden)
       </label>
       <div class="actions">
         <button type="submit" disabled={searching || loading}>
@@ -794,6 +1132,7 @@
                   <th>Name</th>
                   <th>Source Path</th>
                   <th>Children</th>
+                  <th>Child Search</th>
                   <th>Action</th>
                 </tr>
               </thead>
@@ -806,14 +1145,41 @@
                     <td class="path">{container.source_path}</td>
                     <td>{container.child_count}</td>
                     <td>
-                      <button
-                        type="button"
-                        class="secondary"
-                        onclick={() => openContainerInRecent(container)}
-                        disabled={searching || loading}
-                      >
-                        Open in Recent
-                      </button>
+                      {#if container.container_type === "combined"}
+                        {container.include_children_in_search ? "Included" : "Hidden"}
+                      {:else}
+                        -
+                      {/if}
+                    </td>
+                    <td>
+                      <div class="container-actions">
+                        <button
+                          type="button"
+                          class="secondary"
+                          onclick={() => openContainerInRecent(container)}
+                          disabled={searching || loading}
+                        >
+                          Open in Recent
+                        </button>
+                        {#if container.container_type === "combined"}
+                          <button
+                            type="button"
+                            class="secondary"
+                            onclick={() => startEditCombinedContainer(container)}
+                            disabled={combinedBusy}
+                          >
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            class="danger"
+                            onclick={() => deleteCombinedContainer(container)}
+                            disabled={combinedBusy}
+                          >
+                            Delete
+                          </button>
+                        {/if}
+                      </div>
                     </td>
                   </tr>
                 {/each}
@@ -966,6 +1332,7 @@
               <th>Name</th>
               <th>Source Path</th>
               <th>Preview</th>
+                <th>Child Search</th>
               <th>Action</th>
             </tr>
           </thead>
@@ -999,6 +1366,13 @@
                   {/if}
                 </td>
                 <td>
+                  {#if container.container_type === "combined"}
+                    {container.include_children_in_search ? "Included" : "Hidden"}
+                  {:else}
+                    -
+                  {/if}
+                </td>
+                <td>
                   <div class="container-actions">
                     <button
                       type="button"
@@ -1018,12 +1392,30 @@
                         {backfillingThumbs[container.id] ? "Backfilling..." : "Backfill thumbs"}
                       </button>
                     {/if}
+                    {#if container.container_type === "combined"}
+                      <button
+                        type="button"
+                        class="secondary"
+                        onclick={() => startEditCombinedContainer(container)}
+                        disabled={combinedBusy}
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        class="danger"
+                        onclick={() => deleteCombinedContainer(container)}
+                        disabled={combinedBusy}
+                      >
+                        Delete
+                      </button>
+                    {/if}
                   </div>
                 </td>
               </tr>
               {#if expandedContainers[container.id]}
                 <tr class="child-row">
-                  <td colspan="6">
+                  <td colspan="7">
                     {#if loadingThumbs[container.id]}
                       <p class="muted">Loading thumbnails...</p>
                     {:else if (containerThumbs[container.id] || []).length > 0}
@@ -1050,6 +1442,11 @@
                           <li>
                             <span class="child-type">{child.container_type}</span>
                             <span class="child-name">{child.display_name}</span>
+                            {#if child.container_type === "combined"}
+                              <span class="child-meta muted">
+                                Child search: {child.include_children_in_search ? "Included" : "Hidden"}
+                              </span>
+                            {/if}
                             <span class="child-path">{child.source_path}</span>
                           </li>
                         {/each}
@@ -1295,6 +1692,31 @@
     border: 1px solid #e1e7f0;
   }
 
+  .combined-editor {
+    margin-top: 0.7rem;
+    padding: 0.75rem;
+    border: 1px solid #dbe3ef;
+    border-radius: 12px;
+    background: #f8fbff;
+  }
+
+  .combined-child-picker {
+    max-height: 260px;
+    overflow: auto;
+    display: grid;
+    gap: 0.4rem;
+    padding-right: 0.2rem;
+  }
+
+  .combined-child-option {
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.45rem 0.55rem;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    background: #fff;
+  }
+
   table {
     width: 100%;
     border-collapse: collapse;
@@ -1443,6 +1865,10 @@
   .child-path {
     color: #64748b;
     font-size: 0.8rem;
+  }
+
+  .child-meta {
+    font-size: 0.78rem;
   }
 
   @media (max-width: 640px) {
