@@ -12,7 +12,8 @@ use tauri::{Emitter, Manager};
 use walkdir::WalkDir;
 
 const REGISTER_CANCELLED: &str = "register_cancelled";
-const ARCHIVE_VIRTUAL_MAX_NESTED_DEPTH: usize = 2;
+const ARCHIVE_VIRTUAL_DEFAULT_NESTED_DEPTH: usize = 2;
+const ARCHIVE_VIRTUAL_MAX_NESTED_DEPTH: usize = 10;
 
 #[derive(Serialize)]
 struct RegisterResult {
@@ -292,10 +293,65 @@ fn init_database(app: tauri::AppHandle) -> Result<String, String> {
     )
     .map_err(|e| format!("failed to create schema: {e}"))?;
 
+    ensure_app_settings_schema(&conn)?;
     ensure_archive_virtual_container_meta_schema(&conn)?;
     ensure_combined_container_meta_schema(&conn)?;
 
     Ok("database ready".to_string())
+}
+
+fn ensure_app_settings_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_app_settings_updated_at ON app_settings(updated_at);
+        ",
+    )
+    .map_err(|e| format!("failed to create app settings table: {e}"))?;
+
+    Ok(())
+}
+
+fn archive_traversal_depth_for_connection(conn: &Connection) -> Result<usize, String> {
+    let stored = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = 'archive_virtual_nested_depth' LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| ARCHIVE_VIRTUAL_DEFAULT_NESTED_DEPTH.to_string());
+
+    let parsed = stored
+        .trim()
+        .parse::<usize>()
+        .unwrap_or(ARCHIVE_VIRTUAL_DEFAULT_NESTED_DEPTH);
+
+    Ok(parsed.min(ARCHIVE_VIRTUAL_MAX_NESTED_DEPTH))
+}
+
+fn set_archive_traversal_depth_for_connection(
+    conn: &Connection,
+    requested: usize,
+) -> Result<usize, String> {
+    let depth = requested.min(ARCHIVE_VIRTUAL_MAX_NESTED_DEPTH).max(0);
+
+    conn.execute(
+        "
+        INSERT INTO app_settings(key, value, updated_at)
+        VALUES ('archive_virtual_nested_depth', ?, datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = datetime('now')
+        ",
+        params![depth.to_string()],
+    )
+    .map_err(|e| format!("failed to persist archive traversal depth: {e}"))?;
+
+    Ok(depth)
 }
 
 fn ensure_archive_virtual_container_meta_schema(conn: &Connection) -> Result<(), String> {
@@ -955,7 +1011,11 @@ fn collect_media_and_nested_archives_in_dir(
     (media_entries, nested_archives)
 }
 
-fn collect_archive_virtual_media_entries(extractor: &str, extract_dir: &Path) -> Vec<ArchiveVirtualMediaEntry> {
+fn collect_archive_virtual_media_entries(
+    extractor: &str,
+    extract_dir: &Path,
+    max_depth: usize,
+) -> Vec<ArchiveVirtualMediaEntry> {
     let (mut entries, initial_nested_archives) =
         collect_media_and_nested_archives_in_dir(extract_dir, None);
 
@@ -978,7 +1038,7 @@ fn collect_archive_virtual_media_entries(extractor: &str, extract_dir: &Path) ->
             })
             .count();
 
-        if depth > ARCHIVE_VIRTUAL_MAX_NESTED_DEPTH {
+        if depth > max_depth {
             continue;
         }
 
@@ -1011,7 +1071,7 @@ fn collect_archive_virtual_media_entries(extractor: &str, extract_dir: &Path) ->
                 );
                 entries.extend(nested_media);
 
-                if depth < ARCHIVE_VIRTUAL_MAX_NESTED_DEPTH {
+                if depth < max_depth {
                     for nested in nested_archives {
                         queue.push_back(nested);
                     }
@@ -1654,6 +1714,7 @@ fn rebuild_archive_virtual_hierarchy(
     file_hash: &str,
     file_size: i64,
 ) -> Result<(), String> {
+    let nested_depth_limit = archive_traversal_depth_for_connection(conn)?;
     let extractor = match find_archive_extractor() {
         Some(v) => v,
         None => return Ok(()),
@@ -1685,7 +1746,7 @@ fn rebuild_archive_virtual_hierarchy(
         _ => return Ok(()),
     }
 
-    let entries = collect_archive_virtual_media_entries(extractor, &extract_dir);
+    let entries = collect_archive_virtual_media_entries(extractor, &extract_dir, nested_depth_limit);
     if entries.is_empty() {
         persist_archive_virtual_hierarchy(conn, archive_container_id, archive_source_path, &[])?;
         return Ok(());
@@ -2639,6 +2700,18 @@ fn register_folder_blocking(
     }
 
     Ok(result)
+}
+
+#[tauri::command]
+fn get_archive_traversal_depth(app: tauri::AppHandle) -> Result<u32, String> {
+    let conn = open_db(&app)?;
+    Ok(archive_traversal_depth_for_connection(&conn)? as u32)
+}
+
+#[tauri::command]
+fn set_archive_traversal_depth(app: tauri::AppHandle, depth: u32) -> Result<u32, String> {
+    let conn = open_db(&app)?;
+    Ok(set_archive_traversal_depth_for_connection(&conn, depth as usize)? as u32)
 }
 
 #[tauri::command]
@@ -3715,6 +3788,8 @@ pub fn run() {
             register_folder,
             cancel_register,
             list_recent_files,
+            get_archive_traversal_depth,
+            set_archive_traversal_depth,
             list_recent_containers,
             list_container_children,
             list_container_thumbnails,
@@ -3738,9 +3813,11 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_non_leaf_aggregate_slots, collect_media_and_nested_archives_in_dir, normalize_extension_from_path,
-        scan_archive_extracted_images,
+        archive_traversal_depth_for_connection, build_non_leaf_aggregate_slots,
+        collect_media_and_nested_archives_in_dir, normalize_extension_from_path,
+        scan_archive_extracted_images, set_archive_traversal_depth_for_connection,
     };
+    use rusqlite::Connection;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -3851,5 +3928,29 @@ mod tests {
         assert_eq!(a_count, 3);
         assert_eq!(b_count, 3);
         assert_eq!(c_count, 2);
+    }
+
+    #[test]
+    fn archive_traversal_depth_is_persisted_and_clamped() {
+        let conn = Connection::open_in_memory().expect("in-memory db should open");
+        conn.execute_batch(
+            "CREATE TABLE app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .expect("app_settings table should be creatable");
+
+        assert_eq!(archive_traversal_depth_for_connection(&conn).unwrap(), 2);
+
+        set_archive_traversal_depth_for_connection(&conn, 5).unwrap();
+        assert_eq!(archive_traversal_depth_for_connection(&conn).unwrap(), 5);
+
+        set_archive_traversal_depth_for_connection(&conn, 20).unwrap();
+        assert_eq!(archive_traversal_depth_for_connection(&conn).unwrap(), 10);
+
+        set_archive_traversal_depth_for_connection(&conn, 0).unwrap();
+        assert_eq!(archive_traversal_depth_for_connection(&conn).unwrap(), 0);
     }
 }

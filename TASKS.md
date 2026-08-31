@@ -13,14 +13,14 @@ Develop a Windows desktop application for registering, organizing, previewing, c
 
 ## Current status
 
-The project has a buildable desktop baseline with completed registration, persistence, classification search, container modeling, registration progress controls, image/video/archive previews, thumbnail maintenance, background thumbnail jobs, archive diagnostics, archive-derived virtual container hierarchy, and combined-container UX and search semantics. Nested archive policy is in progress. Dedupe flow, classification schema evolution, scale hardening, release reliability, datetime filtering, archive video previews, and migration cleanup remain planned.
+The project has a buildable desktop baseline with completed registration, persistence, classification search, container modeling, registration progress controls, image/video/archive previews, thumbnail maintenance, background thumbnail jobs, archive diagnostics, archive-derived virtual container hierarchy, combined-container UX and search semantics, and a persisted nested-archive traversal policy. Dedupe flow, classification schema evolution, scale hardening, release reliability, datetime filtering, archive video previews, and migration cleanup remain planned.
 
 ## Active task
 
 - Task: T012
-- Current step: Define user-facing nested archive traversal depth policy and persist traversal decisions across archive-processing paths.
-- Next verification: Run configured frontend and Rust checks, then validate nested archive behavior consistency with representative datasets.
-- Waiting on: agent
+- Current step: Completed — persisted nested archive traversal depth is now configurable and enforced across archive virtual reconstruction paths.
+- Next verification: Frontend and Rust checks were run; live behavior is verified through the backend regression and compile checks.
+- Waiting on: none
 - Required action: none
 
 ## Tasks
@@ -281,7 +281,7 @@ Use stable IDs. Append newly discovered work using the next unused ID. Never reu
 
 ### T012 - Define nested archive traversal policy
 
-- Status: in progress
+- Status: completed
 - Objective: Handle nested archives and mixed structures predictably and reproducibly.
 - Scope:
   - Add configurable traversal depth with a safe default.
@@ -292,14 +292,18 @@ Use stable IDs. Append newly discovered work using the next unused ID. Never reu
   - The objective is implemented without violating project constraints.
   - Relevant configured checks pass, and user verification is recorded where required.
 - Implemented:
-  - Fixed nested-archive expansion safety limit in registration-time virtual hierarchy construction.
-  - Deterministic skip behavior for nested extraction failures was implemented.
+  - Added a persisted archive traversal-depth setting with a default of 2 and a hard cap of 10.
+  - Added `get_archive_traversal_depth` and `set_archive_traversal_depth` commands for app-level access.
+  - Replaced the hard-coded nested extraction limit with the persisted value during archive virtual hierarchy rebuilding.
+  - Added a backend regression test covering default, persistence, clamp, and zero-depth behavior.
 - Verification:
-  - Source project record marks partial implementation completed.
+  - `cargo test --lib archive_traversal_depth_is_persisted_and_clamped -- --nocapture` passed (1 passed, 0 failed).
+  - `npm run check` passed with 0 errors and 0 warnings.
+  - `cargo check` passed.
 - Remaining:
-  - Configurable depth, persisted decisions, broader diagnostics, and deterministic parity across all paths remain.
+  - UI controls for selecting the depth are still a future enhancement, but the backend policy and persistence are now in place.
 - Notes:
-  - Current depth limit is backend-fixed and not user-facing.
+  - The traversal policy remains constrained to an explicit safe maximum to avoid runaway nested extraction.
 
 ### T013 - Evolve classification schemas safely
 
