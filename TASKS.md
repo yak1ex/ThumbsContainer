@@ -17,11 +17,46 @@ The project has a buildable desktop baseline with completed registration, persis
 
 ## Active task
 
-- Task: T012
-- Current step: Completed — persisted nested archive traversal depth is now configurable and enforced across archive virtual reconstruction paths.
-- Next verification: Frontend and Rust checks were run; live behavior is verified through the backend regression and compile checks.
+- Task: T010
+- Current step: Planned — define and implement safe duplicate-candidate review and explicit user-confirmed action flow.
+- Next verification: After implementation, run `npm run check`, `npm run build`, `cargo check`, and targeted `cargo test --lib` coverage for duplicate-candidate and action-handling paths.
 - Waiting on: none
 - Required action: none
+
+## Development plan
+
+Planning date: 2026-09-01
+
+1. Phase 1 - T010 safe duplicate management
+  - Why now: duplicate handling is the largest remaining core product gap and already constrained by D001.
+  - Deliverables: candidate listing by hash and metadata, side-by-side preview and metadata comparison, explicit confirmation for move or delete actions, recoverable first-step delete or move target policy.
+  - Verification target: backend command tests for candidate grouping and action guards, plus frontend interaction checks for confirmation and error handling.
+2. Phase 2 - T018 creation datetime metadata and search
+  - Why next: improves search quality and helps disambiguate duplicate candidates with timeline context.
+  - Deliverables: persisted creation datetime fields, timezone and source-of-truth policy, after or before or between search filters.
+  - Verification target: regression tests for filter boundaries and timezone handling; UI confirmation for criteria behavior.
+3. Phase 3 - T019 archive video previews
+  - Why next: closes a current archive-preview coverage gap for mixed media archives.
+  - Deliverables: extracted-video detection, sampled representative frames, deterministic image-versus-video fallback rules aligned with traversal policy from T012.
+  - Verification target: backend tests for fallback ordering and skip reasons; user validation on mixed archive datasets.
+4. Phase 4 - T013 classification schema evolution
+  - Why next: unlocks richer metadata without unsafe schema churn.
+  - Deliverables: multi-dimension ratings, tag normalization and suggestion support, migration-safe classification versioning.
+  - Verification target: migration and backward-compatibility tests; UI checks for edit and bulk operations.
+5. Phase 5 - T014 scale hardening and T015 reliability
+  - Why paired: performance tuning and regression coverage should advance together to prevent silent regressions.
+  - Deliverables: query and index tuning, profiling baselines, expanded backend and frontend regression suite, Windows release checklist.
+  - Verification target: repeatable benchmark snapshots and green automated checks across frontend and Rust.
+6. Phase 6 - T021 migration cleanup and T023 configurable storage
+  - Why later: both tasks are important but lower priority than core user workflows and correctness gaps.
+  - Deliverables: temporary-migration cutover plan and cleanup, configurable app-data root with deterministic initialization or relocation behavior.
+  - Verification target: fresh-database initialization checks, migration-path checks, and user validation of custom storage-root behavior on Windows.
+
+Cross-phase execution rules:
+- Preserve D001 and never perform automatic destructive duplicate cleanup.
+- Avoid dependency, plugin, capability, or permission changes without explicit user approval per D004.
+- Keep long-running file, archive, hash, and media processing off the interactive path.
+- Keep TASKS.md synchronized with each implementation milestone and verification run.
 
 ## Tasks
 
