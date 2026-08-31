@@ -18,8 +18,8 @@ The project has a buildable desktop baseline with completed registration, persis
 ## Active task
 
 - Task: T010
-- Current step: Planned — define and implement safe duplicate-candidate review and explicit user-confirmed action flow.
-- Next verification: After implementation, run `npm run check`, `npm run build`, `cargo check`, and targeted `cargo test --lib` coverage for duplicate-candidate and action-handling paths.
+- Current step: Updated duplicate-card UX to proactively disable Quarantine when a file is already actively quarantined, while keeping backend safety checks.
+- Next verification: Continue with remaining T010 work on focused backend test coverage and decide optional purge-on-exit policy.
 - Waiting on: none
 - Required action: none
 
@@ -57,6 +57,7 @@ Cross-phase execution rules:
 - Avoid dependency, plugin, capability, or permission changes without explicit user approval per D004.
 - Keep long-running file, archive, hash, and media processing off the interactive path.
 - Keep TASKS.md synchronized with each implementation milestone and verification run.
+- Record verification succinctly per milestone and avoid repeating unchanged command-pass entries.
 
 ## Tasks
 
@@ -250,7 +251,7 @@ Use stable IDs. Append newly discovered work using the next unused ID. Never reu
 
 ### T010 - Implement safe duplicate management
 
-- Status: pending
+- Status: in progress
 - Objective: Allow users to review and explicitly act on duplicate candidates without automatic deletion.
 - Scope:
   - List candidates by hash and metadata.
@@ -261,13 +262,38 @@ Use stable IDs. Append newly discovered work using the next unused ID. Never reu
   - The objective is implemented without violating project constraints.
   - Relevant configured checks pass, and user verification is recorded where required.
 - Implemented:
-  - None.
+  - Added backend duplicate-candidate grouping by hash and size via `list_duplicate_groups`, including per-file metadata, preview path, tags, and rating details for side-by-side review.
+  - Added backend guarded duplicate actions that require a current duplicate peer before applying changes:
+    - `move_duplicate_file_to_directory` moves a selected duplicate to a user-selected target directory and updates persisted file and container paths.
+    - `quarantine_duplicate_file` performs a safe-delete-style action by moving a selected duplicate into app-data `duplicate_quarantine` and updating persisted paths.
+  - Added backend archive-container consistency handling after duplicate moves so archive virtual hierarchy paths are rebuilt when the moved file is an archive container source.
+  - Added a frontend Duplicates panel with explicit refresh, duplicate-group inspection, side-by-side comparison selectors, and per-file actions.
+  - Added explicit confirmation prompts before both move and quarantine actions.
+  - Corrected registration move detection so duplicate copies with different paths are not incorrectly treated as moved-path updates when the original path still exists.
+  - Added persisted quarantine history tracking for explicit undo and purge lifecycle actions.
+  - Updated quarantine placement to use a same-location `.thumbscontainer_quarantine` directory near the source file to avoid expensive cross-drive copies for large media.
+  - Added `list_quarantined_duplicates`, `undo_quarantined_duplicate`, and `purge_quarantined_duplicate` commands and connected the UI workflow.
+  - Added a dedicated Quarantined list in the Duplicates panel with explicit Undo and Purge actions and confirmation prompts.
+  - Added `purge_all_quarantined_duplicates` command with per-file failure aggregation for explicit bulk purge.
+  - Added `Purge all` action next to `Refresh Quarantine` in the Duplicates panel.
+  - Updated duplicate comparison rendering to show all files in the selected duplicate group at once, rather than only two selected items.
+  - Prevented repeated quarantine attempts for files that already have an active quarantine history entry.
+  - Added duplicate overview counters (`registered files`, `duplicate groups`, `duplicate files`, `quarantined files`) and displayed them in the Duplicates panel to clarify that zero duplicates does not mean zero registered files.
+  - Added empty quarantine folder cleanup so `.thumbscontainer_quarantine` directories are removed automatically after undo or purge when no files remain.
+  - Updated duplicate comparison card actions to disable `Quarantine` for files that are already in active quarantine, reducing avoidable repeated-action attempts.
 - Verification:
-  - Not run.
+  - Latest automated verification passed: `npm run check` (0 errors, 0 warnings), `npm run build`, `cargo check`, `cargo test --lib` (10 passed, 0 failed).
+  - Earlier intermediate iterations also passed the same check set after each major T010 behavior change.
+  - User verification confirmed re-quarantine attempts are now prevented.
+  - User verification confirmed empty `.thumbscontainer_quarantine` folder cleanup after final undo or purge.
+  - User verification confirmed duplicate summary still reflects registered file counts when duplicate groups are zero.
+  - User verification confirmed duplicate-card quarantine actions are proactively disabled for already-quarantined files.
 - Remaining:
-  - All implementation and verification remain.
+  - Add focused backend tests covering duplicate-group query ordering and action command path-update behavior.
+  - Complete user verification on real duplicate datasets and edge-case paths (target collisions, missing sources, archive duplicates, restore target already occupied).
+  - Decide whether to keep manual purge-only behavior or add an explicit user-configured purge-on-exit flow with confirmations.
 - Notes:
-  - None.
+  - The default delete-equivalent behavior remains non-destructive until the user explicitly runs Purge.
 
 ### T011 - Complete combined-container UX and search semantics
 
@@ -579,6 +605,60 @@ Use stable IDs. Append newly discovered work using the next unused ID. Never reu
 - Notes:
   - Priority is lower than current main functionality tasks.
 
+### T024 - Improve registration performance for network storage
+
+- Status: in progress
+- Objective: Reduce registration latency and redundant I/O overhead for CIFS or SMB-hosted media without changing correctness guarantees.
+- Scope:
+  - Remove avoidable multi-pass directory traversal overhead.
+  - Improve sequential hashing throughput for high-latency network reads.
+  - Identify and document further optimization candidates for phased follow-up.
+- Acceptance criteria:
+  - The objective is implemented without violating project constraints.
+  - Relevant configured checks pass, and user verification is recorded where required.
+- Implemented:
+  - Registration file discovery was changed from two full directory traversals to a single discovery pass reused for both totals and processing.
+  - Hashing read chunk size was increased from 8 KiB to 1 MiB to reduce read-call overhead on network storage paths.
+  - Documented next-step candidates: metadata-assisted change detection policy, batched DB transactions for registration writes, and configurable hashing or preview strategy for remote shares.
+- Verification:
+  - `npm run check` passed.
+  - `npm run build` passed.
+  - `cargo check` passed.
+  - `cargo test --lib` passed (9 passed, 0 failed).
+- Remaining:
+  - Validate performance improvement magnitude against representative CIFS datasets and compare before versus after throughput.
+  - Decide policy for optional reduced hashing or metadata-fast paths when correctness and collision-risk trade-offs are explicit.
+- Notes:
+  - Current improvements are low-risk and preserve existing registration correctness semantics.
+
+### T025 - Expand media and archive extension targeting
+
+- Status: in progress
+- Objective: Extend file-type targeting for requested video, image, and potential archive extensions while preserving deterministic behavior and clear fallback outcomes.
+- Scope:
+  - Add requested video extensions to container and thumbnail kind detection.
+  - Add requested image extensions to image detection and archive image candidate scanning.
+  - Add potential archive extensions to archive container detection for processing attempts.
+  - Identify extensions that remain tool-dependent or require deeper implementation.
+- Acceptance criteria:
+  - The objective is implemented without violating project constraints.
+  - Relevant configured checks pass, and user verification is recorded where required.
+- Implemented:
+  - Added video targeting for `3gp`, `asf`, `divx`, `flv`, `m2t`, `m2ts`, `m4v`, `mov`, `mpeg`, `mpg`, `ogm`, `rm`, `swf`, `ts`, `vg2`, and `wmv`.
+  - Added image targeting for `bmp` and `jpe` in general image detection and thumbnailable-kind routing.
+  - Added archive-container targeting for `iso` and `pdf` so they can flow through archive container handling paths.
+  - Added backend regression tests for new extension coverage in container-type and archive-extension detection.
+- Verification:
+  - `npm run check` passed.
+  - `npm run build` passed.
+  - `cargo check` passed.
+  - `cargo test --lib` passed (9 passed, 0 failed).
+- Remaining:
+  - Verify real-world extractor behavior for `iso` and `pdf` archives; support may vary by available extraction tools.
+  - Confirm ffmpeg behavior and preview quality for all newly added video extensions on representative files.
+- Notes:
+  - PDF-as-archive and ISO extraction depend on external tool capability and may skip gracefully when extraction or decoding support is unavailable.
+
 ## Decisions
 
 ### D001 - Require user-driven duplicate removal
@@ -634,6 +714,18 @@ Use stable IDs. Append newly discovered work using the next unused ID. Never reu
   - Agents must update TASKS.md in the same work cycle as implementation changes.
   - project.md remains a compatibility pointer and must not be used for active task updates.
 - Related tasks: T022
+
+### D006 - Use quarantine move as initial duplicate delete behavior
+
+- Date: 2026-09-01
+- Status: accepted
+- Decision: Implement duplicate delete as a two-step explicit lifecycle: first move to quarantine (recoverable), then optional explicit purge (permanent deletion).
+- Rationale: Large media files can make cross-drive quarantine costly, and the workflow needs clear recoverability plus explicit final deletion control.
+- Consequences:
+  - Quarantine should use a same-location directory when possible to avoid avoidable copy cost.
+  - Undo and Purge actions must remain explicit and user-confirmed.
+  - Automatic purge on app exit is not enabled by default; it requires a separate explicit policy decision.
+- Related tasks: T010
 
 ## Blocked items
 

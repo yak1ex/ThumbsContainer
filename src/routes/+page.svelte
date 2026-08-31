@@ -43,6 +43,58 @@
     thumbnail_data_url: string | null;
   };
 
+  type DuplicateFileRecord = {
+    id: number;
+    path: string;
+    filename: string;
+    hash: string;
+    size: number;
+    created_at: string;
+    thumbnail_path: string | null;
+    thumbnail_data_url: string | null;
+    tags: string[];
+    rating: number | null;
+  };
+
+  type DuplicateGroupRecord = {
+    hash: string;
+    size: number;
+    file_count: number;
+    files: DuplicateFileRecord[];
+  };
+
+  type DuplicateActionResult = {
+    file_id: number;
+    previous_path: string;
+    current_path: string;
+    action: string;
+  };
+
+  type QuarantinedDuplicateRecord = {
+    file_id: number;
+    filename: string;
+    hash: string;
+    size: number;
+    original_path: string;
+    quarantine_path: string;
+    quarantined_at: string;
+    thumbnail_data_url: string | null;
+  };
+
+  type BulkPurgeResult = {
+    requested: number;
+    purged: number;
+    failed: number;
+    failures: string[];
+  };
+
+  type DuplicateOverview = {
+    total_files: number;
+    duplicate_groups: number;
+    duplicate_files: number;
+    quarantined_files: number;
+  };
+
   type FileClassification = {
     tags: string[];
     rating: number | null;
@@ -131,6 +183,18 @@
   let lastMaintenance = $state<ThumbnailMaintenanceResult | null>(null);
   let searchResults = $state<FileRecord[]>([]);
   let searchContainerResults = $state<ContainerRecord[]>([]);
+  let duplicateGroups = $state<DuplicateGroupRecord[]>([]);
+  let duplicatesLoading = $state(false);
+  let duplicateActionBusy = $state(false);
+  let duplicateSelectedGroupIndex = $state<number | null>(null);
+  let duplicateMoveTargetDir = $state("");
+  let quarantinedDuplicates = $state<QuarantinedDuplicateRecord[]>([]);
+  let quarantinedLoading = $state(false);
+  let duplicateOverview = $state<DuplicateOverview | null>(null);
+
+  const quarantinedFileIdSet = $derived.by(() => {
+    return new Set(quarantinedDuplicates.map((v) => v.file_id));
+  });
   let focusedContainerId = $state<number | null>(null);
   let combinedEditorOpen = $state(false);
   let combinedEditContainerId = $state<number | null>(null);
@@ -233,8 +297,265 @@
     return displayThumbnailUrl(file) !== null;
   }
 
+  function displayDuplicateThumbnailUrl(file: DuplicateFileRecord): string | null {
+    if (file.thumbnail_data_url) {
+      return file.thumbnail_data_url;
+    }
+    if (file.thumbnail_path) {
+      return file.thumbnail_path;
+    }
+    return null;
+  }
+
+  function hasDuplicateThumbnail(file: DuplicateFileRecord): boolean {
+    return displayDuplicateThumbnailUrl(file) !== null;
+  }
+
+  function isFileCurrentlyQuarantined(fileId: number): boolean {
+    return quarantinedFileIdSet.has(fileId);
+  }
+
+  function selectDuplicateGroup(groupIndex: number) {
+    duplicateSelectedGroupIndex = groupIndex;
+  }
+
+  const selectedDuplicateGroup = $derived.by(() => {
+    if (duplicateSelectedGroupIndex === null) {
+      return null;
+    }
+    return duplicateGroups[duplicateSelectedGroupIndex] ?? null;
+  });
+
   async function loadRecentFiles() {
     recentFiles = await invoke<FileRecord[]>("list_recent_files", { limit: 25 });
+  }
+
+  async function loadDuplicateGroups() {
+    if (duplicatesLoading) {
+      return;
+    }
+
+    duplicatesLoading = true;
+    try {
+      duplicateGroups = await invoke<DuplicateGroupRecord[]>("list_duplicate_groups", {
+        limitGroups: 60,
+        perGroupLimit: 40
+      });
+
+      if (duplicateGroups.length === 0) {
+        duplicateSelectedGroupIndex = null;
+      } else if (
+        duplicateSelectedGroupIndex === null ||
+        duplicateSelectedGroupIndex >= duplicateGroups.length
+      ) {
+        selectDuplicateGroup(0);
+      }
+    } catch (error) {
+      statusMessage = `Failed to load duplicate groups: ${String(error)}`;
+    } finally {
+      duplicatesLoading = false;
+    }
+  }
+
+  async function loadDuplicateOverview() {
+    try {
+      duplicateOverview = await invoke<DuplicateOverview>("get_duplicate_overview");
+    } catch (error) {
+      statusMessage = `Failed to load duplicate overview: ${String(error)}`;
+    }
+  }
+
+  async function loadQuarantinedDuplicates() {
+    if (quarantinedLoading) {
+      return;
+    }
+
+    quarantinedLoading = true;
+    try {
+      quarantinedDuplicates = await invoke<QuarantinedDuplicateRecord[]>(
+        "list_quarantined_duplicates",
+        {
+          limit: 300
+        }
+      );
+    } catch (error) {
+      statusMessage = `Failed to load quarantined duplicates: ${String(error)}`;
+    } finally {
+      quarantinedLoading = false;
+    }
+  }
+
+  async function chooseDuplicateMoveTargetDir() {
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "Select target directory for duplicate move"
+      });
+
+      if (typeof selected === "string") {
+        duplicateMoveTargetDir = selected;
+      }
+    } catch (error) {
+      statusMessage = `Failed to browse target directory: ${String(error)}`;
+    }
+  }
+
+  async function moveDuplicateFileToDirectory(fileId: number) {
+    if (duplicateActionBusy) {
+      return;
+    }
+    const target = duplicateMoveTargetDir.trim();
+    if (!target) {
+      statusMessage = "Choose a target directory before moving a duplicate file.";
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Move duplicate file ${fileId} to ${target}? This updates its registered source path.`
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    duplicateActionBusy = true;
+    statusMessage = `Moving duplicate file ${fileId}...`;
+
+    try {
+      const result = await invoke<DuplicateActionResult>("move_duplicate_file_to_directory", {
+        fileId,
+        targetDirectory: target
+      });
+      statusMessage = `Duplicate file ${result.file_id} moved to ${result.current_path}.`;
+      await loadDuplicateOverview();
+      await loadDuplicateGroups();
+      await loadRecentFiles();
+      await loadRecentContainers(true);
+    } catch (error) {
+      statusMessage = `Failed to move duplicate file ${fileId}: ${String(error)}`;
+    } finally {
+      duplicateActionBusy = false;
+    }
+  }
+
+  async function quarantineDuplicateById(fileId: number) {
+    if (duplicateActionBusy) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Move duplicate file ${fileId} to a same-location quarantine folder (.thumbscontainer_quarantine)? This avoids cross-drive copy costs and can be undone.`
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    duplicateActionBusy = true;
+    statusMessage = `Quarantining duplicate file ${fileId}...`;
+
+    try {
+      const result = await invoke<DuplicateActionResult>("quarantine_duplicate_file", { fileId });
+      statusMessage = `Duplicate file ${result.file_id} moved to quarantine at ${result.current_path}.`;
+      await loadDuplicateOverview();
+      await loadDuplicateGroups();
+      await loadQuarantinedDuplicates();
+      await loadRecentFiles();
+      await loadRecentContainers(true);
+    } catch (error) {
+      statusMessage = `Failed to quarantine duplicate file ${fileId}: ${String(error)}`;
+    } finally {
+      duplicateActionBusy = false;
+    }
+  }
+
+  async function undoQuarantinedDuplicate(fileId: number) {
+    if (duplicateActionBusy) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Undo quarantine for file ${fileId} and restore it to its original path?`
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    duplicateActionBusy = true;
+    statusMessage = `Restoring quarantined file ${fileId}...`;
+    try {
+      const result = await invoke<DuplicateActionResult>("undo_quarantined_duplicate", { fileId });
+      statusMessage = `File ${result.file_id} restored to ${result.current_path}.`;
+      await loadDuplicateOverview();
+      await loadQuarantinedDuplicates();
+      await loadDuplicateGroups();
+      await loadRecentFiles();
+      await loadRecentContainers(true);
+    } catch (error) {
+      statusMessage = `Failed to restore quarantined file ${fileId}: ${String(error)}`;
+    } finally {
+      duplicateActionBusy = false;
+    }
+  }
+
+  async function purgeQuarantinedDuplicate(fileId: number) {
+    if (duplicateActionBusy) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Permanently delete quarantined file ${fileId}? This cannot be undone.`
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    duplicateActionBusy = true;
+    statusMessage = `Purging quarantined file ${fileId}...`;
+    try {
+      const result = await invoke<DuplicateActionResult>("purge_quarantined_duplicate", { fileId });
+      statusMessage = `File ${result.file_id} permanently deleted.`;
+      await loadDuplicateOverview();
+      await loadQuarantinedDuplicates();
+      await loadDuplicateGroups();
+      await loadRecentFiles();
+      await loadRecentContainers(true);
+    } catch (error) {
+      statusMessage = `Failed to purge quarantined file ${fileId}: ${String(error)}`;
+    } finally {
+      duplicateActionBusy = false;
+    }
+  }
+
+  async function purgeAllQuarantinedDuplicates() {
+    if (duplicateActionBusy || quarantinedDuplicates.length === 0) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Permanently delete all ${quarantinedDuplicates.length} quarantined file(s)? This cannot be undone.`
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    duplicateActionBusy = true;
+    statusMessage = "Purging all quarantined files...";
+    try {
+      const result = await invoke<BulkPurgeResult>("purge_all_quarantined_duplicates");
+      statusMessage = `Purge all completed. Purged ${result.purged}/${result.requested}, failed ${result.failed}.`;
+      if (result.failures.length > 0) {
+        statusMessage = `${statusMessage} First failure: ${result.failures[0]}`;
+      }
+      await loadDuplicateOverview();
+      await loadQuarantinedDuplicates();
+      await loadDuplicateGroups();
+      await loadRecentFiles();
+      await loadRecentContainers(true);
+    } catch (error) {
+      statusMessage = `Failed to purge all quarantined files: ${String(error)}`;
+    } finally {
+      duplicateActionBusy = false;
+    }
   }
 
   async function loadContainerThumbnails(containerId: number, force = false) {
@@ -611,6 +932,9 @@
       await loadRecentFiles();
       await loadRecentContainers();
       await loadCombineCandidates();
+      await loadDuplicateOverview();
+      await loadDuplicateGroups();
+      await loadQuarantinedDuplicates();
     } catch (error) {
       statusMessage = `Initialization failed: ${String(error)}`;
     }
@@ -772,6 +1096,9 @@
       }
       await loadRecentFiles();
       await loadRecentContainers();
+      await loadDuplicateOverview();
+      await loadDuplicateGroups();
+      await loadQuarantinedDuplicates();
     } catch (error) {
       statusMessage = `Registration failed: ${String(error)}`;
     } finally {
@@ -1190,6 +1517,201 @@
           <p class="muted">No matching containers.</p>
         {/if}
       {/if}
+    {/if}
+  </section>
+
+  <section class="panel">
+    <h2>Duplicates</h2>
+    <p class="muted">
+      Review candidate duplicates grouped by hash and size. Actions require explicit confirmation.
+    </p>
+    {#if duplicateOverview}
+      <div class="result-grid">
+        <p>Registered files: <strong>{duplicateOverview.total_files}</strong></p>
+        <p>Duplicate groups: <strong>{duplicateOverview.duplicate_groups}</strong></p>
+        <p>Duplicate files: <strong>{duplicateOverview.duplicate_files}</strong></p>
+        <p>Quarantined files: <strong>{duplicateOverview.quarantined_files}</strong></p>
+      </div>
+    {/if}
+    <div class="actions">
+      <button
+        type="button"
+        class="secondary"
+        onclick={async () => {
+          await loadDuplicateOverview();
+          await loadDuplicateGroups();
+        }}
+        disabled={duplicatesLoading || duplicateActionBusy || loading}
+      >
+        {duplicatesLoading ? "Loading..." : "Refresh Duplicates"}
+      </button>
+      <input
+        placeholder="Target directory for Move action"
+        bind:value={duplicateMoveTargetDir}
+        disabled={duplicateActionBusy || duplicatesLoading}
+      />
+      <button
+        type="button"
+        class="secondary"
+        onclick={chooseDuplicateMoveTargetDir}
+        disabled={duplicateActionBusy || duplicatesLoading}
+      >
+        Browse Target
+      </button>
+    </div>
+
+    {#if duplicateGroups.length === 0}
+      <p class="muted">No duplicate groups found. Registered files may still exist and are shown above.</p>
+    {:else}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Group</th>
+              <th>Count</th>
+              <th>Size</th>
+              <th>Hash</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each duplicateGroups as group, idx}
+              <tr class:focused-container-row={duplicateSelectedGroupIndex === idx}>
+                <td>#{idx + 1}</td>
+                <td>{group.file_count}</td>
+                <td>{group.size}</td>
+                <td class="hash">{group.hash.slice(0, 24)}...</td>
+                <td>
+                  <button
+                    type="button"
+                    class="secondary"
+                    onclick={() => selectDuplicateGroup(idx)}
+                    disabled={duplicateActionBusy}
+                  >
+                    Inspect
+                  </button>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
+
+    {#if selectedDuplicateGroup}
+      <h3>Comparison</h3>
+      <p class="muted">Comparing all {selectedDuplicateGroup.files.length} file(s) in this duplicate group.</p>
+
+      <div class="duplicate-compare-grid">
+        {#each selectedDuplicateGroup.files as file}
+          <article class="duplicate-card">
+            <h4>#{file.id}</h4>
+            {#if hasDuplicateThumbnail(file)}
+              <img
+                class="thumb duplicate-thumb"
+                src={displayDuplicateThumbnailUrl(file) ?? undefined}
+                alt="duplicate preview"
+              />
+            {:else}
+              <div class="thumb placeholder duplicate-thumb">No preview</div>
+            {/if}
+            <p><strong>Name:</strong> {file.filename}</p>
+            <p class="path">{file.path}</p>
+            <p><strong>Created:</strong> {file.created_at}</p>
+            <p><strong>Rating:</strong> {file.rating ?? "-"}</p>
+            <p><strong>Tags:</strong> {file.tags.length ? file.tags.join(", ") : "-"}</p>
+            <div class="actions">
+              <button
+                type="button"
+                class="secondary"
+                onclick={() => moveDuplicateFileToDirectory(file.id)}
+                disabled={duplicateActionBusy}
+              >
+                Move To Target
+              </button>
+              <button
+                type="button"
+                class="danger"
+                onclick={() => quarantineDuplicateById(file.id)}
+                disabled={duplicateActionBusy || isFileCurrentlyQuarantined(file.id)}
+              >
+                {isFileCurrentlyQuarantined(file.id)
+                  ? "Already Quarantined"
+                  : "Quarantine (Undoable)"}
+              </button>
+            </div>
+          </article>
+        {/each}
+      </div>
+    {/if}
+
+    <h3>Quarantined</h3>
+    <div class="actions">
+      <button
+        type="button"
+        class="secondary"
+        onclick={loadQuarantinedDuplicates}
+        disabled={duplicateActionBusy || quarantinedLoading}
+      >
+        {quarantinedLoading ? "Loading..." : "Refresh Quarantine"}
+      </button>
+      <button
+        type="button"
+        class="danger"
+        onclick={purgeAllQuarantinedDuplicates}
+        disabled={duplicateActionBusy || quarantinedLoading || quarantinedDuplicates.length === 0}
+      >
+        Purge all
+      </button>
+    </div>
+    {#if quarantinedDuplicates.length === 0}
+      <p class="muted">No quarantined files.</p>
+    {:else}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>File ID</th>
+              <th>Name</th>
+              <th>Original Path</th>
+              <th>Quarantine Path</th>
+              <th>Quarantined At</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each quarantinedDuplicates as item}
+              <tr>
+                <td>{item.file_id}</td>
+                <td>{item.filename}</td>
+                <td class="path">{item.original_path}</td>
+                <td class="path">{item.quarantine_path}</td>
+                <td>{item.quarantined_at}</td>
+                <td>
+                  <div class="container-actions">
+                    <button
+                      type="button"
+                      class="secondary"
+                      onclick={() => undoQuarantinedDuplicate(item.file_id)}
+                      disabled={duplicateActionBusy}
+                    >
+                      Undo
+                    </button>
+                    <button
+                      type="button"
+                      class="danger"
+                      onclick={() => purgeQuarantinedDuplicate(item.file_id)}
+                      disabled={duplicateActionBusy}
+                    >
+                      Purge
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
     {/if}
   </section>
 
@@ -1715,6 +2237,36 @@
     border: 1px solid #e2e8f0;
     border-radius: 8px;
     background: #fff;
+  }
+
+  .duplicate-compare-grid {
+    margin-top: 0.7rem;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 0.7rem;
+  }
+
+  .duplicate-card {
+    border: 1px solid #dbe3ef;
+    border-radius: 12px;
+    background: #f8fbff;
+    padding: 0.75rem;
+    display: grid;
+    gap: 0.35rem;
+  }
+
+  .duplicate-card h4 {
+    margin: 0;
+  }
+
+  .duplicate-card p {
+    margin: 0;
+  }
+
+  .duplicate-thumb {
+    width: 100%;
+    height: 180px;
+    object-fit: cover;
   }
 
   table {

@@ -51,6 +51,64 @@ struct FileClassification {
 }
 
 #[derive(Serialize)]
+struct DuplicateFileRecord {
+    id: i64,
+    path: String,
+    filename: String,
+    hash: String,
+    size: i64,
+    created_at: String,
+    thumbnail_path: Option<String>,
+    thumbnail_data_url: Option<String>,
+    tags: Vec<String>,
+    rating: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct DuplicateGroupRecord {
+    hash: String,
+    size: i64,
+    file_count: i64,
+    files: Vec<DuplicateFileRecord>,
+}
+
+#[derive(Serialize)]
+struct DuplicateActionResult {
+    file_id: i64,
+    previous_path: String,
+    current_path: String,
+    action: String,
+}
+
+#[derive(Serialize)]
+struct QuarantinedDuplicateRecord {
+    file_id: i64,
+    filename: String,
+    hash: String,
+    size: i64,
+    original_path: String,
+    quarantine_path: String,
+    quarantined_at: String,
+    thumbnail_data_url: Option<String>,
+}
+
+#[derive(Serialize)]
+struct BulkPurgeResult {
+    requested: usize,
+    purged: usize,
+    failed: usize,
+    failures: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct DuplicateOverview {
+    total_files: i64,
+    duplicate_groups: i64,
+    duplicate_files: i64,
+    quarantined_files: i64,
+}
+
+#[derive(Serialize)]
 struct ContainerRecord {
     id: i64,
     container_type: String,
@@ -207,6 +265,19 @@ fn init_database(app: tauri::AppHandle) -> Result<String, String> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_files_hash_size ON files(hash, size);
+
+                CREATE TABLE IF NOT EXISTS duplicate_quarantine_history (
+                    id INTEGER PRIMARY KEY,
+                    file_id INTEGER NOT NULL,
+                    original_path TEXT NOT NULL,
+                    quarantine_path TEXT NOT NULL,
+                    quarantined_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    restored_at TEXT,
+                    purged_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_duplicate_quarantine_history_file_id
+                    ON duplicate_quarantine_history(file_id);
 
                 CREATE TABLE IF NOT EXISTS containers (
                     id INTEGER PRIMARY KEY,
@@ -509,23 +580,30 @@ fn detect_container_type(filename: &str) -> String {
     let lower = filename.to_lowercase();
     let extension = lower.rsplit('.').next().unwrap_or_default();
 
-    match extension {
-        "mp4" | "mkv" | "avi" => "video".to_string(),
-        "jpg" | "jpeg" | "png" | "gif" | "webp" | "avif" => "image".to_string(),
-        "rar" | "7z" | "zip" | "lzh" | "cbz" | "cbr" | "cb7" => "archive".to_string(),
-        _ => "other".to_string(),
+    if is_video_extension(extension) {
+        return "video".to_string();
     }
+    if is_image_extension(extension) {
+        return "image".to_string();
+    }
+    if is_archive_container_extension(extension) {
+        return "archive".to_string();
+    }
+
+    "other".to_string()
 }
 
 fn detect_thumbnailable_kind(filename: &str) -> Option<&'static str> {
     let lower = filename.to_lowercase();
     let extension = lower.rsplit('.').next().unwrap_or_default();
 
-    match extension {
-        "mp4" | "mkv" | "avi" => Some("video"),
-        "jpg" | "jpeg" | "png" | "gif" | "webp" | "avif" => Some("image"),
-        _ => None,
+    if is_video_extension(extension) {
+        return Some("video");
     }
+    if is_image_extension(extension) {
+        return Some("image");
+    }
+    None
 }
 
 fn thumbnail_cache_path(app: &tauri::AppHandle, file_hash: &str, size: i64) -> Result<PathBuf, String> {
@@ -891,16 +969,16 @@ fn is_archive_image_extension(ext: &str) -> bool {
     is_image_extension(ext)
         || matches!(
             ext,
-            "jpe" | "jfif" | "bmp" | "dib" | "tif" | "tiff" | "heic" | "heif"
+            "jfif" | "dib" | "tif" | "tiff" | "heic" | "heif"
         )
 }
 
 fn is_archive_video_extension(ext: &str) -> bool {
-    matches!(ext, "mp4" | "mkv" | "avi" | "mov" | "webm" | "m4v")
+    is_video_extension(ext)
 }
 
 fn is_archive_container_extension(ext: &str) -> bool {
-    matches!(ext, "rar" | "7z" | "zip" | "lzh" | "cbz" | "cbr" | "cb7")
+    matches!(ext, "rar" | "7z" | "zip" | "lzh" | "cbz" | "cbr" | "cb7" | "iso" | "pdf")
 }
 
 fn scan_archive_extracted_images(extract_dir: &Path) -> Result<ArchiveImageScanResult, String> {
@@ -1880,6 +1958,223 @@ fn thumbnail_data_url_from_path(path: &str) -> Option<String> {
     Some(format!("data:{mime};base64,{}", BASE64_STANDARD.encode(bytes)))
 }
 
+fn split_tags_csv(tags_csv: &str) -> Vec<String> {
+    tags_csv
+        .split(',')
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+        .collect()
+}
+
+fn duplicate_identity_for_file(
+    conn: &Connection,
+    file_id: i64,
+) -> Result<(String, String, String, i64), String> {
+    conn.query_row(
+        "SELECT path, filename, hash, size FROM files WHERE id = ?",
+        [file_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        },
+    )
+    .map_err(|e| format!("failed to resolve file {file_id}: {e}"))
+}
+
+fn file_has_duplicate_peer(conn: &Connection, hash: &str, size: i64, file_id: i64) -> Result<bool, String> {
+    let count = conn
+        .query_row(
+            "SELECT COUNT(1) FROM files WHERE hash = ? AND size = ? AND id != ?",
+            params![hash, size, file_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| format!("failed to query duplicate peers for file {file_id}: {e}"))?;
+    Ok(count > 0)
+}
+
+fn move_file_path(source_path: &Path, destination_path: &Path) -> Result<(), String> {
+    if destination_path.exists() {
+        return Err(format!(
+            "destination already exists: {}",
+            destination_path.to_string_lossy()
+        ));
+    }
+
+    if let Some(parent) = destination_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "failed to create destination directory {}: {e}",
+                parent.to_string_lossy()
+            )
+        })?;
+    }
+
+    if let Err(rename_err) = std::fs::rename(source_path, destination_path) {
+        std::fs::copy(source_path, destination_path).map_err(|copy_err| {
+            format!(
+                "failed to move file (rename: {rename_err}, copy fallback: {copy_err})"
+            )
+        })?;
+        std::fs::remove_file(source_path)
+            .map_err(|e| format!("failed to remove original file after copy move: {e}"))?;
+    }
+
+    Ok(())
+}
+
+fn unique_destination_path(base_dir: &Path, base_name: &str) -> PathBuf {
+    let initial = base_dir.join(base_name);
+    if !initial.exists() {
+        return initial;
+    }
+
+    for idx in 1..=1000 {
+        let candidate = base_dir.join(format!("{base_name}_{idx}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    base_dir.join(format!("{base_name}_{}", std::process::id()))
+}
+
+fn quarantine_directory_for_source(app: &tauri::AppHandle, source: &Path) -> Result<PathBuf, String> {
+    if let Some(parent) = source.parent() {
+        return Ok(parent.join(".thumbscontainer_quarantine"));
+    }
+
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("failed to resolve app data dir for fallback quarantine: {e}"))?;
+    Ok(app_data.join("duplicate_quarantine"))
+}
+
+fn path_is_quarantine_path(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        Component::Normal(segment) => {
+            segment
+                .to_str()
+                .map(|s| s.eq_ignore_ascii_case(".thumbscontainer_quarantine") || s.eq_ignore_ascii_case("duplicate_quarantine"))
+                .unwrap_or(false)
+        }
+        _ => false,
+    })
+}
+
+fn cleanup_quarantine_parent_if_empty(path: &Path) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+
+    if !path_is_quarantine_path(parent) {
+        return Ok(());
+    }
+
+    if !parent.exists() {
+        return Ok(());
+    }
+
+    let mut entries = std::fs::read_dir(parent)
+        .map_err(|e| format!("failed to read quarantine directory {}: {e}", parent.to_string_lossy()))?;
+    if entries.next().is_none() {
+        std::fs::remove_dir(parent)
+            .map_err(|e| format!("failed to remove empty quarantine directory {}: {e}", parent.to_string_lossy()))?;
+    }
+
+    Ok(())
+}
+
+fn mark_existing_active_quarantine_history_resolved(conn: &Connection, file_id: i64) -> Result<(), String> {
+    conn.execute(
+        "
+        UPDATE duplicate_quarantine_history
+        SET restored_at = COALESCE(restored_at, datetime('now'))
+        WHERE file_id = ? AND restored_at IS NULL AND purged_at IS NULL
+        ",
+        [file_id],
+    )
+    .map_err(|e| format!("failed to close existing active quarantine history for file {file_id}: {e}"))?;
+
+    Ok(())
+}
+
+fn active_quarantine_entry(
+    conn: &Connection,
+    file_id: i64,
+) -> Result<Option<(i64, String, String, String)>, String> {
+    let entry = conn
+        .query_row(
+            "
+            SELECT id, original_path, quarantine_path, quarantined_at
+            FROM duplicate_quarantine_history
+            WHERE file_id = ? AND restored_at IS NULL AND purged_at IS NULL
+            ORDER BY id DESC
+            LIMIT 1
+            ",
+            [file_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .ok();
+
+    Ok(entry)
+}
+
+fn remove_file_and_orphaned_container(conn: &Connection, file_id: i64) -> Result<(), String> {
+    let linked_container_id = conn
+        .query_row(
+            "SELECT container_id FROM file_containers WHERE file_id = ?",
+            [file_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok();
+
+    conn.execute("DELETE FROM files WHERE id = ?", [file_id])
+        .map_err(|e| format!("failed to delete file record {file_id}: {e}"))?;
+
+    if let Some(container_id) = linked_container_id {
+        let file_link_count = conn
+            .query_row(
+                "SELECT COUNT(1) FROM file_containers WHERE container_id = ?",
+                [container_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| format!("failed to count file links for container {container_id}: {e}"))?;
+        let parent_link_count = conn
+            .query_row(
+                "SELECT COUNT(1) FROM container_children WHERE child_container_id = ?",
+                [container_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| format!("failed to count parent links for container {container_id}: {e}"))?;
+        let child_link_count = conn
+            .query_row(
+                "SELECT COUNT(1) FROM container_children WHERE parent_container_id = ?",
+                [container_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| format!("failed to count child links for container {container_id}: {e}"))?;
+
+        if file_link_count == 0 && parent_link_count == 0 && child_link_count == 0 {
+            let _ = conn.execute("DELETE FROM containers WHERE id = ?", [container_id]);
+        }
+    }
+
+    Ok(())
+}
+
 fn upsert_file_container(
     conn: &Connection,
     file_id: i64,
@@ -2069,7 +2364,33 @@ fn rebuild_combined_container_thumbnail_slots(
 }
 
 fn is_image_extension(ext: &str) -> bool {
-    matches!(ext, "jpg" | "jpeg" | "png" | "gif" | "webp" | "avif")
+    matches!(ext, "jpg" | "jpeg" | "jpe" | "png" | "gif" | "webp" | "avif" | "bmp")
+}
+
+fn is_video_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "mp4"
+            | "mkv"
+            | "avi"
+            | "webm"
+            | "3gp"
+            | "asf"
+            | "divx"
+            | "flv"
+            | "m2t"
+            | "m2ts"
+            | "m4v"
+            | "mov"
+            | "mpeg"
+            | "mpg"
+            | "ogm"
+            | "rm"
+            | "swf"
+            | "ts"
+            | "vg2"
+            | "wmv"
+    )
 }
 
 fn rebuild_image_group_containers(conn: &Connection, folder_path: &str) -> Result<GroupRebuildResult, String> {
@@ -2332,7 +2653,7 @@ where
 {
     let mut file = File::open(path).map_err(|e| format!("failed to open file {:?}: {e}", path))?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 8192];
+    let mut buffer = vec![0u8; 1_048_576];
     let mut processed: u64 = 0;
 
     loop {
@@ -2357,6 +2678,40 @@ fn emit_register_progress(app: &tauri::AppHandle, progress: &RegisterProgress) {
     let _ = app.emit("register-progress", progress.clone());
 }
 
+fn find_moved_file_candidate(
+    conn: &Connection,
+    hash: &str,
+    size: i64,
+    current_path: &str,
+) -> Result<Option<i64>, String> {
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT id, path
+            FROM files
+            WHERE hash = ? AND size = ? AND path != ?
+            ORDER BY updated_at DESC, id DESC
+            ",
+        )
+        .map_err(|e| format!("failed to prepare moved-file candidate query: {e}"))?;
+
+    let rows = stmt
+        .query_map(params![hash, size, current_path], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| format!("failed to query moved-file candidates: {e}"))?;
+
+    for row in rows {
+        let (candidate_id, candidate_path) =
+            row.map_err(|e| format!("failed to map moved-file candidate row: {e}"))?;
+        if !Path::new(&candidate_path).exists() {
+            return Ok(Some(candidate_id));
+        }
+    }
+
+    Ok(None)
+}
+
 fn register_folder_blocking(
     app: &tauri::AppHandle,
     folder_path: &str,
@@ -2369,11 +2724,12 @@ fn register_folder_blocking(
 
     let conn = open_db(app)?;
 
-    let total_files = WalkDir::new(path)
+    let file_entries: Vec<_> = WalkDir::new(path)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
-        .count();
+        .collect();
+    let total_files = file_entries.len();
 
     let mut result = RegisterResult {
         scanned_files: 0,
@@ -2408,10 +2764,7 @@ fn register_folder_blocking(
         },
     );
 
-    for entry in WalkDir::new(path).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
+    for entry in file_entries {
 
         if cancel_flag.load(Ordering::Relaxed) {
             result.canceled = true;
@@ -2496,27 +2849,20 @@ fn register_folder_blocking(
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| path_text.clone());
 
-        let updated = conn
-            .execute(
+        let moved_file_id = find_moved_file_candidate(&conn, &hash, size_i64, &path_text)?;
+
+        if let Some(moved_file_id) = moved_file_id {
+            conn.execute(
                 "
                 UPDATE files
                 SET path = ?, filename = ?, updated_at = datetime('now')
-                WHERE hash = ? AND size = ? AND path != ?
+                WHERE id = ?
                 ",
-                params![path_text, filename, hash, size_i64, path_text],
+                params![path_text, filename, moved_file_id],
             )
-            .map_err(|e| format!("failed to update moved file path: {e}"))?;
+            .map_err(|e| format!("failed to update moved file path for id {moved_file_id}: {e}"))?;
 
-        if updated > 0 {
-            result.updated_paths += updated as usize;
-
-            let moved_file_id = conn
-                .query_row(
-                    "SELECT id FROM files WHERE hash = ? AND size = ? AND path = ?",
-                    params![hash, size_i64, path_text],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map_err(|e| format!("failed to resolve moved file id: {e}"))?;
+            result.updated_paths += 1;
             let outcome = upsert_file_container(&conn, moved_file_id, &filename, &path_text)?;
             if outcome.created {
                 result.created_containers += 1;
@@ -3216,6 +3562,492 @@ fn search_files(
 }
 
 #[tauri::command]
+fn list_duplicate_groups(
+    app: tauri::AppHandle,
+    limit_groups: Option<u32>,
+    per_group_limit: Option<u32>,
+) -> Result<Vec<DuplicateGroupRecord>, String> {
+    let conn = open_db(&app)?;
+    let group_cap = limit_groups.unwrap_or(50).max(1).min(200);
+    let file_cap = per_group_limit.unwrap_or(25).max(2).min(200);
+
+    let mut group_stmt = conn
+        .prepare(
+            "
+            SELECT hash, size, COUNT(1) AS file_count
+            FROM files
+            GROUP BY hash, size
+            HAVING COUNT(1) > 1
+            ORDER BY file_count DESC, MAX(updated_at) DESC, hash ASC
+            LIMIT ?
+            ",
+        )
+        .map_err(|e| format!("failed to prepare duplicate group query: {e}"))?;
+
+    let group_rows = group_stmt
+        .query_map([group_cap], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|e| format!("failed to query duplicate groups: {e}"))?;
+
+    let mut groups = Vec::new();
+
+    for group_row in group_rows {
+        let (hash, size, file_count) =
+            group_row.map_err(|e| format!("failed to map duplicate group row: {e}"))?;
+
+        let mut file_stmt = conn
+            .prepare(
+                "
+                SELECT
+                    f.id,
+                    f.path,
+                    f.filename,
+                    f.hash,
+                    f.size,
+                    f.created_at,
+                    t.thumbnail_path,
+                    fr.rating,
+                    COALESCE((
+                        SELECT group_concat(tag_name, ',')
+                        FROM (
+                            SELECT tg.name AS tag_name
+                            FROM file_tags ft
+                            INNER JOIN tags tg ON tg.id = ft.tag_id
+                            WHERE ft.file_id = f.id
+                            ORDER BY tg.name ASC
+                        )
+                    ), '') AS tags_csv
+                FROM files f
+                LEFT JOIN thumbnails t ON t.file_id = f.id
+                LEFT JOIN file_ratings fr ON fr.file_id = f.id
+                WHERE f.hash = ?1 AND f.size = ?2
+                ORDER BY f.updated_at DESC, f.id DESC
+                LIMIT ?3
+                ",
+            )
+            .map_err(|e| format!("failed to prepare duplicate file query: {e}"))?;
+
+        let file_rows = file_stmt
+            .query_map(params![hash, size, file_cap], |row| {
+                let thumbnail_path: Option<String> = row.get(6)?;
+                let tags_csv: String = row.get(8)?;
+                Ok(DuplicateFileRecord {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    filename: row.get(2)?,
+                    hash: row.get(3)?,
+                    size: row.get(4)?,
+                    created_at: row.get(5)?,
+                    thumbnail_path: thumbnail_path.clone(),
+                    thumbnail_data_url: thumbnail_path
+                        .as_deref()
+                        .and_then(thumbnail_data_url_from_path),
+                    tags: split_tags_csv(&tags_csv),
+                    rating: row.get(7)?,
+                })
+            })
+            .map_err(|e| format!("failed to query duplicate files for hash group: {e}"))?;
+
+        let mut files = Vec::new();
+        for file_row in file_rows {
+            files.push(file_row.map_err(|e| format!("failed to map duplicate file row: {e}"))?);
+        }
+
+        groups.push(DuplicateGroupRecord {
+            hash,
+            size,
+            file_count,
+            files,
+        });
+    }
+
+    Ok(groups)
+}
+
+fn update_file_path_and_related_containers(
+    app: &tauri::AppHandle,
+    conn: &Connection,
+    file_id: i64,
+    hash: &str,
+    size: i64,
+    target_path: &str,
+) -> Result<(), String> {
+    let filename = Path::new(target_path)
+        .file_name()
+        .and_then(|v| v.to_str())
+        .ok_or_else(|| format!("failed to derive filename from destination path: {target_path}"))?
+        .to_string();
+
+    conn.execute(
+        "UPDATE files SET path = ?, filename = ?, updated_at = datetime('now') WHERE id = ?",
+        params![target_path, filename, file_id],
+    )
+    .map_err(|e| format!("failed to update moved file record {file_id}: {e}"))?;
+
+    let upsert_outcome = upsert_file_container(conn, file_id, &filename, target_path)?;
+
+    let container_type = conn
+        .query_row(
+            "SELECT container_type FROM containers WHERE id = ?",
+            [upsert_outcome.container_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|e| {
+            format!(
+                "failed to resolve container type for moved file {file_id} container {}: {e}",
+                upsert_outcome.container_id
+            )
+        })?;
+
+    if container_type == "archive" {
+        rebuild_archive_virtual_hierarchy(
+            app,
+            conn,
+            upsert_outcome.container_id,
+            target_path,
+            hash,
+            size,
+        )?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn move_duplicate_file_to_directory(
+    app: tauri::AppHandle,
+    file_id: i64,
+    target_directory: String,
+) -> Result<DuplicateActionResult, String> {
+    let conn = open_db(&app)?;
+    let (source_path, filename, hash, size) = duplicate_identity_for_file(&conn, file_id)?;
+
+    if !file_has_duplicate_peer(&conn, &hash, size, file_id)? {
+        return Err(format!(
+            "file {file_id} no longer has duplicate peers; refresh duplicate candidates"
+        ));
+    }
+
+    let source = PathBuf::from(&source_path);
+    if !source.exists() {
+        return Err(format!(
+            "source file no longer exists on disk: {}",
+            source.to_string_lossy()
+        ));
+    }
+
+    let target_dir = PathBuf::from(target_directory.trim());
+    if target_directory.trim().is_empty() {
+        return Err("target directory is required".to_string());
+    }
+
+    let destination = unique_destination_path(&target_dir, &filename);
+    move_file_path(&source, &destination)?;
+
+    let destination_text = destination.to_string_lossy().to_string();
+    update_file_path_and_related_containers(&app, &conn, file_id, &hash, size, &destination_text)?;
+
+    Ok(DuplicateActionResult {
+        file_id,
+        previous_path: source_path,
+        current_path: destination_text,
+        action: "move".to_string(),
+    })
+}
+
+#[tauri::command]
+fn quarantine_duplicate_file(app: tauri::AppHandle, file_id: i64) -> Result<DuplicateActionResult, String> {
+    let conn = open_db(&app)?;
+    if active_quarantine_entry(&conn, file_id)?.is_some() {
+        return Err(format!("file {file_id} is already quarantined; use Undo or Purge first"));
+    }
+
+    let (source_path, filename, hash, size) = duplicate_identity_for_file(&conn, file_id)?;
+
+    if !file_has_duplicate_peer(&conn, &hash, size, file_id)? {
+        return Err(format!(
+            "file {file_id} no longer has duplicate peers; refresh duplicate candidates"
+        ));
+    }
+
+    let source = PathBuf::from(&source_path);
+    if !source.exists() {
+        return Err(format!(
+            "source file no longer exists on disk: {}",
+            source.to_string_lossy()
+        ));
+    }
+
+    if path_is_quarantine_path(&source) {
+        return Err(format!("file {file_id} is already in a quarantine directory"));
+    }
+
+    let quarantine_dir = quarantine_directory_for_source(&app, &source)?;
+    std::fs::create_dir_all(&quarantine_dir)
+        .map_err(|e| format!("failed to create duplicate quarantine directory: {e}"))?;
+
+    let quarantined_name = format!("{}_{}", file_id, filename);
+    let destination = unique_destination_path(&quarantine_dir, &quarantined_name);
+    move_file_path(&source, &destination)?;
+
+    let destination_text = destination.to_string_lossy().to_string();
+    update_file_path_and_related_containers(&app, &conn, file_id, &hash, size, &destination_text)?;
+    mark_existing_active_quarantine_history_resolved(&conn, file_id)?;
+    conn.execute(
+        "
+        INSERT INTO duplicate_quarantine_history(file_id, original_path, quarantine_path, quarantined_at)
+        VALUES (?, ?, ?, datetime('now'))
+        ",
+        params![file_id, source_path, destination_text],
+    )
+    .map_err(|e| format!("failed to record quarantine history for file {file_id}: {e}"))?;
+
+    Ok(DuplicateActionResult {
+        file_id,
+        previous_path: source_path,
+        current_path: destination_text,
+        action: "quarantine".to_string(),
+    })
+}
+
+#[tauri::command]
+fn list_quarantined_duplicates(app: tauri::AppHandle, limit: Option<u32>) -> Result<Vec<QuarantinedDuplicateRecord>, String> {
+    let conn = open_db(&app)?;
+    let cap = limit.unwrap_or(200).min(1000);
+
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT
+                q.file_id,
+                f.filename,
+                f.hash,
+                f.size,
+                q.original_path,
+                q.quarantine_path,
+                q.quarantined_at,
+                t.thumbnail_path
+            FROM duplicate_quarantine_history q
+            INNER JOIN files f ON f.id = q.file_id
+            LEFT JOIN thumbnails t ON t.file_id = q.file_id
+            WHERE q.restored_at IS NULL AND q.purged_at IS NULL
+            ORDER BY q.id DESC
+            LIMIT ?
+            ",
+        )
+        .map_err(|e| format!("failed to prepare quarantined duplicates query: {e}"))?;
+
+    let rows = stmt
+        .query_map([cap], |row| {
+            let thumb_path: Option<String> = row.get(7)?;
+            Ok(QuarantinedDuplicateRecord {
+                file_id: row.get(0)?,
+                filename: row.get(1)?,
+                hash: row.get(2)?,
+                size: row.get(3)?,
+                original_path: row.get(4)?,
+                quarantine_path: row.get(5)?,
+                quarantined_at: row.get(6)?,
+                thumbnail_data_url: thumb_path.as_deref().and_then(thumbnail_data_url_from_path),
+            })
+        })
+        .map_err(|e| format!("failed to query quarantined duplicates: {e}"))?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("failed to map quarantined duplicate row: {e}"))?);
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+fn undo_quarantined_duplicate(app: tauri::AppHandle, file_id: i64) -> Result<DuplicateActionResult, String> {
+    let conn = open_db(&app)?;
+    let Some((history_id, original_path, _, _)) = active_quarantine_entry(&conn, file_id)? else {
+        return Err(format!("file {file_id} has no active quarantine history"));
+    };
+
+    let (current_path, filename, hash, size) = duplicate_identity_for_file(&conn, file_id)?;
+    let source = PathBuf::from(&current_path);
+    if !source.exists() {
+        return Err(format!("quarantined file is missing on disk: {}", source.to_string_lossy()));
+    }
+    let restore_target = PathBuf::from(&original_path);
+    if restore_target.exists() {
+        return Err(format!("cannot undo quarantine because target already exists: {original_path}"));
+    }
+
+    move_file_path(&source, &restore_target)?;
+    cleanup_quarantine_parent_if_empty(&source)?;
+    update_file_path_and_related_containers(
+        &app,
+        &conn,
+        file_id,
+        &hash,
+        size,
+        &restore_target.to_string_lossy(),
+    )?;
+    conn.execute(
+        "UPDATE duplicate_quarantine_history SET restored_at = datetime('now') WHERE id = ?",
+        [history_id],
+    )
+    .map_err(|e| format!("failed to mark quarantine history restored for file {file_id}: {e}"))?;
+
+    Ok(DuplicateActionResult {
+        file_id,
+        previous_path: current_path,
+        current_path: restore_target.to_string_lossy().to_string(),
+        action: format!("undo_quarantine:{filename}"),
+    })
+}
+
+#[tauri::command]
+fn purge_quarantined_duplicate(app: tauri::AppHandle, file_id: i64) -> Result<DuplicateActionResult, String> {
+    let conn = open_db(&app)?;
+    let Some((history_id, _, quarantine_path, _)) = active_quarantine_entry(&conn, file_id)? else {
+        return Err(format!("file {file_id} has no active quarantine history"));
+    };
+
+    let (current_path, _, _, _) = duplicate_identity_for_file(&conn, file_id)?;
+    if current_path != quarantine_path {
+        return Err(format!(
+            "file {file_id} is no longer at the active quarantine path; current path: {current_path}"
+        ));
+    }
+
+    let current = PathBuf::from(&current_path);
+    if current.exists() {
+        std::fs::remove_file(&current)
+            .map_err(|e| format!("failed to purge quarantined file {}: {e}", current.to_string_lossy()))?;
+    }
+    cleanup_quarantine_parent_if_empty(&current)?;
+
+    remove_file_and_orphaned_container(&conn, file_id)?;
+    conn.execute(
+        "UPDATE duplicate_quarantine_history SET purged_at = datetime('now') WHERE id = ?",
+        [history_id],
+    )
+    .map_err(|e| format!("failed to mark quarantine history purged for file {file_id}: {e}"))?;
+
+    Ok(DuplicateActionResult {
+        file_id,
+        previous_path: current_path,
+        current_path: "(purged)".to_string(),
+        action: "purge".to_string(),
+    })
+}
+
+#[tauri::command]
+fn get_duplicate_overview(app: tauri::AppHandle) -> Result<DuplicateOverview, String> {
+    let conn = open_db(&app)?;
+
+    let total_files = conn
+        .query_row("SELECT COUNT(1) FROM files", [], |row| row.get::<_, i64>(0))
+        .map_err(|e| format!("failed to count files: {e}"))?;
+
+    let duplicate_groups = conn
+        .query_row(
+            "
+            SELECT COUNT(1)
+            FROM (
+                SELECT 1
+                FROM files
+                GROUP BY hash, size
+                HAVING COUNT(1) > 1
+            )
+            ",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| format!("failed to count duplicate groups: {e}"))?;
+
+    let duplicate_files = conn
+        .query_row(
+            "
+            SELECT COALESCE(SUM(group_count), 0)
+            FROM (
+                SELECT COUNT(1) AS group_count
+                FROM files
+                GROUP BY hash, size
+                HAVING COUNT(1) > 1
+            )
+            ",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| format!("failed to count duplicate files: {e}"))?;
+
+    let quarantined_files = conn
+        .query_row(
+            "
+            SELECT COUNT(1)
+            FROM duplicate_quarantine_history
+            WHERE restored_at IS NULL AND purged_at IS NULL
+            ",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| format!("failed to count quarantined files: {e}"))?;
+
+    Ok(DuplicateOverview {
+        total_files,
+        duplicate_groups,
+        duplicate_files,
+        quarantined_files,
+    })
+}
+
+#[tauri::command]
+fn purge_all_quarantined_duplicates(app: tauri::AppHandle) -> Result<BulkPurgeResult, String> {
+    let conn = open_db(&app)?;
+
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT file_id
+            FROM duplicate_quarantine_history
+            WHERE restored_at IS NULL AND purged_at IS NULL
+            ORDER BY id DESC
+            ",
+        )
+        .map_err(|e| format!("failed to prepare active quarantine query: {e}"))?;
+
+    let rows = stmt
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|e| format!("failed to query active quarantine rows: {e}"))?;
+
+    let mut file_ids: Vec<i64> = Vec::new();
+    for row in rows {
+        file_ids.push(row.map_err(|e| format!("failed to map active quarantine row: {e}"))?);
+    }
+
+    let requested = file_ids.len();
+    let mut purged = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+
+    for file_id in file_ids {
+        match purge_quarantined_duplicate(app.clone(), file_id) {
+            Ok(_) => {
+                purged += 1;
+            }
+            Err(err) => failures.push(format!("file {file_id}: {err}")),
+        }
+    }
+
+    Ok(BulkPurgeResult {
+        requested,
+        purged,
+        failed: failures.len(),
+        failures,
+    })
+}
+
+#[tauri::command]
 fn search_containers(
     app: tauri::AppHandle,
     path_query: Option<String>,
@@ -3797,6 +4629,14 @@ pub fn run() {
             inspect_thumbnail_cache,
             cleanup_thumbnail_cache,
             search_files,
+            list_duplicate_groups,
+            get_duplicate_overview,
+            list_quarantined_duplicates,
+            move_duplicate_file_to_directory,
+            quarantine_duplicate_file,
+            undo_quarantined_duplicate,
+            purge_quarantined_duplicate,
+            purge_all_quarantined_duplicates,
             search_containers,
             list_containers_for_combining,
             create_combined_container,
@@ -3814,7 +4654,12 @@ pub fn run() {
 mod tests {
     use super::{
         archive_traversal_depth_for_connection, build_non_leaf_aggregate_slots,
-        collect_media_and_nested_archives_in_dir, normalize_extension_from_path,
+        collect_media_and_nested_archives_in_dir, file_has_duplicate_peer,
+        detect_container_type,
+        is_archive_container_extension,
+        path_is_quarantine_path,
+        normalize_extension_from_path,
+        split_tags_csv,
         scan_archive_extracted_images, set_archive_traversal_depth_for_connection,
     };
     use rusqlite::Connection;
@@ -3952,5 +4797,67 @@ mod tests {
 
         set_archive_traversal_depth_for_connection(&conn, 0).unwrap();
         assert_eq!(archive_traversal_depth_for_connection(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn split_tags_csv_ignores_empty_entries() {
+        let tags = split_tags_csv("alpha, beta ,, ,gamma");
+        assert_eq!(tags, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn duplicate_peer_detection_requires_another_file() {
+        let conn = Connection::open_in_memory().expect("in-memory db should open");
+        conn.execute_batch(
+            "
+            CREATE TABLE files (
+              id INTEGER PRIMARY KEY,
+              hash TEXT NOT NULL,
+              size INTEGER NOT NULL,
+              path TEXT NOT NULL UNIQUE,
+              filename TEXT NOT NULL,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            ",
+        )
+        .expect("files table should be creatable");
+
+        conn.execute(
+            "INSERT INTO files(id, hash, size, path, filename) VALUES (1, 'h', 10, 'a', 'a')",
+            [],
+        )
+        .expect("insert should succeed");
+        assert!(!file_has_duplicate_peer(&conn, "h", 10, 1).unwrap());
+
+        conn.execute(
+            "INSERT INTO files(id, hash, size, path, filename) VALUES (2, 'h', 10, 'b', 'b')",
+            [],
+        )
+        .expect("second insert should succeed");
+        assert!(file_has_duplicate_peer(&conn, "h", 10, 1).unwrap());
+    }
+
+    #[test]
+    fn detect_container_type_covers_added_extensions() {
+        assert_eq!(detect_container_type("video.m2ts"), "video");
+        assert_eq!(detect_container_type("video.wmv"), "video");
+        assert_eq!(detect_container_type("image.bmp"), "image");
+        assert_eq!(detect_container_type("image.jpe"), "image");
+        assert_eq!(detect_container_type("doc.pdf"), "archive");
+        assert_eq!(detect_container_type("disk.iso"), "archive");
+    }
+
+    #[test]
+    fn archive_container_extension_covers_iso_and_pdf() {
+        assert!(is_archive_container_extension("iso"));
+        assert!(is_archive_container_extension("pdf"));
+    }
+
+    #[test]
+    fn quarantine_path_detection_handles_known_folder_names() {
+        assert!(path_is_quarantine_path(Path::new("C:/x/.thumbscontainer_quarantine/file.mp4")));
+        assert!(path_is_quarantine_path(Path::new("C:/x/duplicate_quarantine/file.mp4")));
+        assert!(!path_is_quarantine_path(Path::new("C:/x/media/file.mp4")));
     }
 }
