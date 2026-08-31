@@ -518,6 +518,28 @@ Use stable IDs. Append newly discovered work using the next unused ID. Never reu
 - Notes:
   - This is a documentation-process migration task.
 
+### T023 - Support configurable app data storage location
+
+- Status: pending
+- Objective: Allow users to choose where database and related storage files are placed, including thumbnail cache files.
+- Scope:
+  - Define a user-configurable storage root for application data.
+  - Relocate or initialize database and thumbnail cache under the configured root.
+  - Validate configured path accessibility, free-space constraints, and error reporting.
+  - Define migration behavior from existing default location to configured location.
+  - Keep behavior deterministic across startup, registration, and maintenance workflows.
+- Acceptance criteria:
+  - The objective is implemented without violating project constraints.
+  - Relevant configured checks pass, and user verification is recorded where required.
+- Implemented:
+  - None.
+- Verification:
+  - Not run.
+- Remaining:
+  - All implementation and verification remain.
+- Notes:
+  - Priority is lower than current main functionality tasks.
+
 ## Decisions
 
 ### D001 - Require user-driven duplicate removal
