@@ -2033,14 +2033,33 @@ fn unique_destination_path(base_dir: &Path, base_name: &str) -> PathBuf {
         return initial;
     }
 
+    let path = Path::new(base_name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(base_name);
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty());
+
     for idx in 1..=1000 {
-        let candidate = base_dir.join(format!("{base_name}_{idx}"));
+        let candidate_name = match ext {
+            Some(extension) => format!("{stem}_{idx}.{extension}"),
+            None => format!("{stem}_{idx}"),
+        };
+        let candidate = base_dir.join(candidate_name);
         if !candidate.exists() {
             return candidate;
         }
     }
 
-    base_dir.join(format!("{base_name}_{}", std::process::id()))
+    let fallback_name = match ext {
+        Some(extension) => format!("{stem}_{}_{}.{extension}", std::process::id(), std::process::id()),
+        None => format!("{stem}_{}_{}", std::process::id(), std::process::id()),
+    };
+    base_dir.join(fallback_name)
 }
 
 fn quarantine_directory_for_source(app: &tauri::AppHandle, source: &Path) -> Result<PathBuf, String> {
@@ -3561,16 +3580,11 @@ fn search_files(
     Ok(out)
 }
 
-#[tauri::command]
-fn list_duplicate_groups(
-    app: tauri::AppHandle,
-    limit_groups: Option<u32>,
-    per_group_limit: Option<u32>,
+fn list_duplicate_groups_for_connection(
+    conn: &Connection,
+    group_cap: u32,
+    file_cap: u32,
 ) -> Result<Vec<DuplicateGroupRecord>, String> {
-    let conn = open_db(&app)?;
-    let group_cap = limit_groups.unwrap_or(50).max(1).min(200);
-    let file_cap = per_group_limit.unwrap_or(25).max(2).min(200);
-
     let mut group_stmt = conn
         .prepare(
             "
@@ -3669,14 +3683,23 @@ fn list_duplicate_groups(
     Ok(groups)
 }
 
-fn update_file_path_and_related_containers(
-    app: &tauri::AppHandle,
+#[tauri::command]
+fn list_duplicate_groups(
+    app: tauri::AppHandle,
+    limit_groups: Option<u32>,
+    per_group_limit: Option<u32>,
+) -> Result<Vec<DuplicateGroupRecord>, String> {
+    let conn = open_db(&app)?;
+    let group_cap = limit_groups.unwrap_or(50).max(1).min(200);
+    let file_cap = per_group_limit.unwrap_or(25).max(2).min(200);
+    list_duplicate_groups_for_connection(&conn, group_cap, file_cap)
+}
+
+fn update_file_record_and_container_for_move(
     conn: &Connection,
     file_id: i64,
-    hash: &str,
-    size: i64,
     target_path: &str,
-) -> Result<(), String> {
+) -> Result<(String, i64, String), String> {
     let filename = Path::new(target_path)
         .file_name()
         .and_then(|v| v.to_str())
@@ -3704,15 +3727,22 @@ fn update_file_path_and_related_containers(
             )
         })?;
 
+    Ok((filename, upsert_outcome.container_id, container_type))
+}
+
+fn update_file_path_and_related_containers(
+    app: &tauri::AppHandle,
+    conn: &Connection,
+    file_id: i64,
+    hash: &str,
+    size: i64,
+    target_path: &str,
+) -> Result<(), String> {
+    let (_, container_id, container_type) =
+        update_file_record_and_container_for_move(conn, file_id, target_path)?;
+
     if container_type == "archive" {
-        rebuild_archive_virtual_hierarchy(
-            app,
-            conn,
-            upsert_outcome.container_id,
-            target_path,
-            hash,
-            size,
-        )?;
+        rebuild_archive_virtual_hierarchy(app, conn, container_id, target_path, hash, size)?;
     }
 
     Ok(())
@@ -4654,13 +4684,12 @@ pub fn run() {
 mod tests {
     use super::{
         archive_traversal_depth_for_connection, build_non_leaf_aggregate_slots,
-        collect_media_and_nested_archives_in_dir, file_has_duplicate_peer,
-        detect_container_type,
-        is_archive_container_extension,
-        path_is_quarantine_path,
-        normalize_extension_from_path,
-        split_tags_csv,
-        scan_archive_extracted_images, set_archive_traversal_depth_for_connection,
+        collect_media_and_nested_archives_in_dir, detect_container_type,
+        file_has_duplicate_peer, is_archive_container_extension,
+        list_duplicate_groups_for_connection, normalize_extension_from_path,
+        path_is_quarantine_path, scan_archive_extracted_images, split_tags_csv,
+        set_archive_traversal_depth_for_connection, unique_destination_path,
+        update_file_record_and_container_for_move, upsert_file_container,
     };
     use rusqlite::Connection;
     use std::fs;
@@ -4671,6 +4700,74 @@ mod tests {
             fs::create_dir_all(parent).expect("failed to create parent directory for test file");
         }
         fs::write(path, b"x").expect("failed to create test file");
+    }
+
+    fn create_duplicate_query_schema(conn: &Connection) {
+        conn.execute_batch(
+            "
+            CREATE TABLE files (
+              id INTEGER PRIMARY KEY,
+              hash TEXT NOT NULL,
+              size INTEGER NOT NULL,
+              path TEXT NOT NULL UNIQUE,
+              filename TEXT NOT NULL,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE thumbnails (
+              file_id INTEGER PRIMARY KEY,
+              thumbnail_path TEXT NOT NULL,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE file_ratings (
+              file_id INTEGER PRIMARY KEY,
+              rating INTEGER NOT NULL,
+              updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE tags (
+              id INTEGER PRIMARY KEY,
+              name TEXT NOT NULL UNIQUE,
+              created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE file_tags (
+              file_id INTEGER NOT NULL,
+              tag_id INTEGER NOT NULL,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              PRIMARY KEY (file_id, tag_id)
+            );
+            ",
+        )
+        .expect("duplicate query schema should be creatable");
+    }
+
+    fn create_file_and_container_schema(conn: &Connection) {
+        conn.execute_batch(
+            "
+            CREATE TABLE files (
+              id INTEGER PRIMARY KEY,
+              hash TEXT NOT NULL,
+              size INTEGER NOT NULL,
+              path TEXT NOT NULL UNIQUE,
+              filename TEXT NOT NULL,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE containers (
+              id INTEGER PRIMARY KEY,
+              container_type TEXT NOT NULL,
+              display_name TEXT NOT NULL,
+              source_path TEXT NOT NULL,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE file_containers (
+              file_id INTEGER PRIMARY KEY,
+              container_id INTEGER NOT NULL
+            );
+            ",
+        )
+        .expect("file and container schema should be creatable");
     }
 
     #[test]
@@ -4800,6 +4897,31 @@ mod tests {
     }
 
     #[test]
+    fn unique_destination_path_keeps_original_extension_when_suffixing() {
+        let dir = std::env::temp_dir().join(format!(
+            "thumbscontainer_unique_destination_{}",
+            std::process::id()
+        ));
+        if dir.exists() {
+            let _ = fs::remove_dir_all(&dir);
+        }
+        fs::create_dir_all(&dir).expect("failed to create temp duplicate target dir");
+
+        let existing = dir.join("movie.mp4");
+        let existing_next = dir.join("movie_1.mp4");
+        create_file(&existing);
+        create_file(&existing_next);
+
+        let first = unique_destination_path(&dir, "movie.mp4");
+        let second = unique_destination_path(&dir, "movie_1.mp4");
+
+        assert_eq!(first.file_name().unwrap().to_string_lossy(), "movie_2.mp4");
+        assert_eq!(second.file_name().unwrap().to_string_lossy(), "movie_1_1.mp4");
+
+        fs::remove_dir_all(&dir).expect("failed to clean up test temp dir");
+    }
+
+    #[test]
     fn split_tags_csv_ignores_empty_entries() {
         let tags = split_tags_csv("alpha, beta ,, ,gamma");
         assert_eq!(tags, vec!["alpha", "beta", "gamma"]);
@@ -4836,6 +4958,93 @@ mod tests {
         )
         .expect("second insert should succeed");
         assert!(file_has_duplicate_peer(&conn, "h", 10, 1).unwrap());
+    }
+
+    #[test]
+    fn duplicate_group_query_orders_by_size_recency_and_hash() {
+        let conn = Connection::open_in_memory().expect("in-memory db should open");
+        create_duplicate_query_schema(&conn);
+
+        conn.execute_batch(
+            "
+            INSERT INTO files(id, hash, size, path, filename, updated_at) VALUES
+              (1, 'group_a', 100, 'C:/media/a1.jpg', 'a1.jpg', '2026-09-01 09:00:00'),
+              (2, 'group_a', 100, 'C:/media/a2.jpg', 'a2.jpg', '2026-09-01 09:00:00'),
+              (3, 'group_a', 100, 'C:/media/a3.jpg', 'a3.jpg', '2026-09-01 08:00:00'),
+              (4, 'group_b', 100, 'C:/media/b1.jpg', 'b1.jpg', '2026-09-01 11:00:00'),
+              (5, 'group_b', 100, 'C:/media/b2.jpg', 'b2.jpg', '2026-09-01 10:00:00'),
+              (6, 'group_c', 100, 'C:/media/c1.jpg', 'c1.jpg', '2026-09-01 07:00:00'),
+              (7, 'group_c', 100, 'C:/media/c2.jpg', 'c2.jpg', '2026-09-01 06:00:00');
+            ",
+        )
+        .expect("duplicate group seed data should insert");
+
+        let groups = list_duplicate_groups_for_connection(&conn, 10, 10)
+            .expect("duplicate groups should load");
+
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].hash, "group_a");
+        assert_eq!(groups[0].file_count, 3);
+        assert_eq!(groups[1].hash, "group_b");
+        assert_eq!(groups[2].hash, "group_c");
+
+        let top_group_file_ids: Vec<i64> = groups[0].files.iter().map(|file| file.id).collect();
+        assert_eq!(top_group_file_ids, vec![2, 1, 3]);
+    }
+
+    #[test]
+    fn move_path_update_keeps_container_link_and_updates_metadata() {
+        let conn = Connection::open_in_memory().expect("in-memory db should open");
+        create_file_and_container_schema(&conn);
+
+        conn.execute(
+            "INSERT INTO files(id, hash, size, path, filename) VALUES (1, 'h1', 42, 'C:/source/original.jpg', 'original.jpg')",
+            [],
+        )
+        .expect("file seed should insert");
+
+        let initial_container = upsert_file_container(&conn, 1, "original.jpg", "C:/source/original.jpg")
+            .expect("initial container upsert should succeed")
+            .container_id;
+
+        let (_, updated_container, container_type) = update_file_record_and_container_for_move(
+            &conn,
+            1,
+            "D:/target/renamed.jpg",
+        )
+        .expect("path update helper should succeed");
+
+        assert_eq!(updated_container, initial_container);
+        assert_eq!(container_type, "image");
+
+        let (path, filename): (String, String) = conn
+            .query_row(
+                "SELECT path, filename FROM files WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("updated file should be queryable");
+        assert_eq!(path, "D:/target/renamed.jpg");
+        assert_eq!(filename, "renamed.jpg");
+
+        let (display_name, source_path): (String, String) = conn
+            .query_row(
+                "SELECT display_name, source_path FROM containers WHERE id = ?",
+                [updated_container],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("updated container should be queryable");
+        assert_eq!(display_name, "renamed.jpg");
+        assert_eq!(source_path, "D:/target/renamed.jpg");
+
+        let linked_container_id: i64 = conn
+            .query_row(
+                "SELECT container_id FROM file_containers WHERE file_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("file should still be linked to a container");
+        assert_eq!(linked_container_id, updated_container);
     }
 
     #[test]

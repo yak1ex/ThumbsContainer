@@ -17,11 +17,11 @@ The project has a buildable desktop baseline with completed registration, persis
 
 ## Active task
 
-- Task: T010
-- Current step: Updated duplicate-card UX to proactively disable Quarantine when a file is already actively quarantined, while keeping backend safety checks.
-- Next verification: Continue with remaining T010 work on focused backend test coverage and decide optional purge-on-exit policy.
-- Waiting on: none
-- Required action: none
+- Task: T026
+- Current step: T010 duplicate management is complete and verified. Ready to begin T026 stale-file and quarantine cleanup implementation.
+- Next step: Define and implement stale-file and stale-quarantine-reference detection and cleanup logic.
+- Waiting on: user decision to proceed with T026
+- Required action: confirm T026 should begin, or identify any other priority work
 
 ## Development plan
 
@@ -251,7 +251,7 @@ Use stable IDs. Append newly discovered work using the next unused ID. Never reu
 
 ### T010 - Implement safe duplicate management
 
-- Status: in progress
+- Status: completed
 - Objective: Allow users to review and explicitly act on duplicate candidates without automatic deletion.
 - Scope:
   - List candidates by hash and metadata.
@@ -281,19 +281,27 @@ Use stable IDs. Append newly discovered work using the next unused ID. Never reu
   - Added duplicate overview counters (`registered files`, `duplicate groups`, `duplicate files`, `quarantined files`) and displayed them in the Duplicates panel to clarify that zero duplicates does not mean zero registered files.
   - Added empty quarantine folder cleanup so `.thumbscontainer_quarantine` directories are removed automatically after undo or purge when no files remain.
   - Updated duplicate comparison card actions to disable `Quarantine` for files that are already in active quarantine, reducing avoidable repeated-action attempts.
+  - Added focused backend unit coverage for duplicate-group ordering, duplicate action path-update behavior, and extension-preserving collision naming.
 - Verification:
-  - Latest automated verification passed: `npm run check` (0 errors, 0 warnings), `npm run build`, `cargo check`, `cargo test --lib` (10 passed, 0 failed).
+  - Latest automated verification passed: `cargo check`; `cargo test --lib` (12 passed, 0 failed).
+  - Previous full-stack verification set already passed for existing duplicate workflow behavior: `npm run check` (0 errors, 0 warnings), `npm run build`, `cargo check`, `cargo test --lib` (10 passed, 0 failed).
   - Earlier intermediate iterations also passed the same check set after each major T010 behavior change.
   - User verification confirmed re-quarantine attempts are now prevented.
   - User verification confirmed empty `.thumbscontainer_quarantine` folder cleanup after final undo or purge.
   - User verification confirmed duplicate summary still reflects registered file counts when duplicate groups are zero.
   - User verification confirmed duplicate-card quarantine actions are proactively disabled for already-quarantined files.
+  - User verification confirmed target-collision handling no longer overwrites the original file and preserves the original extension while suffixing the basename: `TESTTEST1_1.mp4` instead of `TESTTEST1.mp4_1` (verified after implementation).
+  - User verification confirmed restore-target conflicts are blocked safely: quarantining a file, recreating the original file path, and then choosing Undo fails with `cannot undo quarantine because target already exists` and does not overwrite the existing file.
+  - User verification remains pending for missing-source handling: create a stale duplicate candidate whose file no longer exists on disk and confirm the action is rejected without mutation.
+  - User verification confirmed the archive-duplicate safety path for a duplicate archive containing image subfolders: moving or quarantining the archive updates the archive file path while preserving archive-container consistency and leaving the derived archive-virtual hierarchy coherent.
+  - User verification confirmed missing-source handling: attempting to move or quarantine a stale duplicate candidate whose file no longer exists on disk is safely rejected with error message `source file no longer exists on disk: [path]` without any database or filesystem mutations.
 - Remaining:
-  - Add focused backend tests covering duplicate-group query ordering and action command path-update behavior.
-  - Complete user verification on real duplicate datasets and edge-case paths (target collisions, missing sources, archive duplicates, restore target already occupied).
-  - Decide whether to keep manual purge-only behavior or add an explicit user-configured purge-on-exit flow with confirmations.
+  - None.
 - Notes:
   - The default delete-equivalent behavior remains non-destructive until the user explicitly runs Purge.
+  - Manual purge-only behavior is the accepted policy for T010 and remains sufficient for the current stage; automatic purge-on-exit is not enabled by default and would require an explicit later design change.
+  - Purge marks quarantine history entries as purged in the database but does not remove stale quarantine directory paths or orphaned thumbnail records; this database cleanup is addressed by the separate T026 maintenance task.
+  - The separate stale-file maintenance task remains tracked as T026, because database drift from externally deleted files (including stale quarantine directory references) is a repair workflow rather than a duplicate-action policy.
 
 ### T011 - Complete combined-container UX and search semantics
 
@@ -658,6 +666,32 @@ Use stable IDs. Append newly discovered work using the next unused ID. Never reu
   - Confirm ffmpeg behavior and preview quality for all newly added video extensions on representative files.
 - Notes:
   - PDF-as-archive and ISO extraction depend on external tool capability and may skip gracefully when extraction or decoding support is unavailable.
+
+### T026 - Repair stale file references and quarantine cleanup in the database
+
+- Status: pending
+- Objective: Allow the user to repair DB state after files are deleted outside the app and clean up stale quarantine directory references and orphaned metadata.
+- Scope:
+  - Scan DB records for file paths that no longer exist on disk.
+  - Scan quarantine history for paths that reference quarantine directories no longer on disk.
+  - Remove stale file records and orphaned links in a transaction.
+  - Remove stale thumbnail and container metadata tied to missing files.
+  - Remove stale quarantine history entries whose quarantine directories have been cleaned up externally.
+  - Surface the cleanup result to the user as a visible maintenance summary.
+  - Keep the operation explicit and non-destructive to the filesystem beyond the DB-state cleanup itself.
+- Acceptance criteria:
+  - The objective is implemented without violating project constraints.
+  - Relevant configured checks pass, and user verification is recorded where required.
+- Implemented:
+  - None.
+- Verification:
+  - Not run.
+- Remaining:
+  - All implementation and verification remain.
+- Notes:
+  - This is a maintenance command, separate from T010 duplicate workflow logic, because stale deletions and external cleanup are rare but should still be repairable without risking silent destructive behavior.
+  - The repair should be explicit and user-triggered, not silently auto-run on startup or on every duplicate action.
+  - Scope includes both stale file references (from external file deletion) and stale quarantine directory references (from external quarantine folder cleanup).
 
 ## Decisions
 
